@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Remove="Tests/**/*.cs" />
+    <Content Include="Tools/*;ThirdParty/*" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Assets/BrandIcon.png" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="Assets/MenuBarIcon.png" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="HtmlAgilityPack" Version="1.13.0" />
+  </ItemGroup>
+  <Target Name="BuildChatWeb" BeforeTargets="Build">
+    <Exec WorkingDirectory="$(MSBuildProjectDirectory)/Web" Command="npm run build" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)/Web/dist/index.html;$(MSBuildProjectDirectory)/Web/dist/translation.html" DestinationFolder="$(TargetDir)Web" />
+  </Target>
+  <Target Name="BuildNativePanel" AfterTargets="Build">
+    <Exec Command="xcrun clang -fobjc-arc -Wall -Wextra -Werror -mmacosx-version-min=26.0 -dynamiclib -framework AppKit -framework ApplicationServices -framework Security -framework WebKit -framework QuartzCore &quot;$(MSBuildProjectDirectory)/NativePanel.m&quot; -o &quot;$(TargetDir)libSynorPanel.dylib&quot;" />
+  </Target>
+</Project>

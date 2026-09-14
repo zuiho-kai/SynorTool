@@ -1,0 +1,23 @@
+{
+  "name": "synor-chat-demo",
+  "version": "1.0.0",
+  "scripts": {
+    "build": "tsc --noEmit && node build.mjs"
+  },
+  "type": "commonjs",
+  "dependencies": {
+    "@assistant-ui/react": "0.15.19",
+    "@streamdown/math": "1.0.2",
+    "katex": "0.16.47",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "streamdown": "2.6.0"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "esbuild": "0.28.2",
+    "typescript": "7.0.2"
+  },
+  "private": true
+}

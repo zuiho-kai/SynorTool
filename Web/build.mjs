@@ -1,0 +1,9 @@
+import { build } from 'esbuild';
+import { readFile, mkdir, writeFile } from 'node:fs/promises';
+const result = await build({entryPoints:['main.tsx'],bundle:true,write:false,format:'iife',target:'safari17',minify:true,define:{'process.env.NODE_ENV':'"production"'}});
+const mathCss = await build({entryPoints:['node_modules/katex/dist/katex.min.css'],bundle:true,write:false,minify:true,loader:{'.woff2':'dataurl','.woff':'dataurl','.ttf':'dataurl'}});
+const css = mathCss.outputFiles[0].text + '\n' + await readFile('style.css','utf8');
+await mkdir('dist',{recursive:true});
+await writeFile('dist/index.html', `<!doctype html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'"><title>Synor 聊天演示</title><style>${css}</style></head><body><div id="root"></div><script>${result.outputFiles[0].text.replace(/<\/script/gi,'<\\/script')}</script></body></html>`);
+await writeFile('dist/translation.html',(await readFile('dist/index.html','utf8')).replace('<script>', '<script>window.__SYNOR_TRANSLATION__=true;'));
+console.log('Built local WebView pages.');
