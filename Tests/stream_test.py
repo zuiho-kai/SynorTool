@@ -6,7 +6,7 @@ repo = pathlib.Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix='synor-stream-tests-') as directory:
     root = pathlib.Path(directory)
     project = root / 'Bridge.csproj'
-    project.write_text(f'''<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><AllowUnsafeBlocks>true</AllowUnsafeBlocks></PropertyGroup><ItemGroup><PackageReference Include="HtmlAgilityPack" Version="1.13.0"/><Compile Include="{repo}/WebFetch.cs"/><Compile Include="{repo}/ChatClient.cs"/><Compile Include="{repo}/AiSettings.cs"/><Compile Include="{repo}/AgentTools.cs"/><Content Include="{repo}/Tools/*" Link="Tools/%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest"/></ItemGroup></Project>''')
+    project.write_text(f'''<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><AllowUnsafeBlocks>true</AllowUnsafeBlocks></PropertyGroup><ItemGroup><PackageReference Include="HtmlAgilityPack" Version="1.13.0"/><Compile Include="{repo}/WebFetch.cs"/><Compile Include="{repo}/ChatClient.cs"/><Compile Include="{repo}/AiSettings.cs"/><Compile Include="{repo}/ModelCatalog.cs"/><Compile Include="{repo}/PiAi/Core.cs"/><Compile Include="{repo}/PiAi/OpenAiAdapters.cs"/><Compile Include="{repo}/AgentTools.cs"/><Content Include="{repo}/Tools/*" Link="Tools/%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest"/></ItemGroup></Project>''')
     (root / 'Program.cs').write_text('while (await Console.In.ReadLineAsync() is { } line) ChatClient.Callback(line);')
     subprocess.run(['dotnet', 'build', str(project), '-v:q'], check=True)
     (root / 'bridge.c').write_text('''#include <stdio.h>
@@ -21,6 +21,12 @@ const char *synor_settings(const char *s){static char *saved;if(s){free(saved);s
     class Server(BaseHTTPRequestHandler):
         def log_message(self, *_): pass
         def do_GET(self):
+            if self.path == '/v1/models':
+                if self.headers.get('Authorization') == 'Bearer bad-key':
+                    self.send_response(401); self.send_header('Content-Type', 'application/json'); self.end_headers()
+                    self.wfile.write(json.dumps({'error':{'message':'invalid api key'}}).encode()); return
+                self.send_response(200); self.send_header('Content-Type', 'application/json'); self.end_headers()
+                self.wfile.write(json.dumps({'object':'list','data':[{'id':'alpha-model'},{'id':'beta-model'},{'id':'alpha-model'}]}).encode()); return
             if self.path in ['/redirect', '/loop']:
                 self.send_response(302); self.send_header('Location', '/page' if self.path == '/redirect' else '/loop'); self.end_headers(); return
             self.send_response(404 if self.path == '/missing' else 200)
@@ -115,9 +121,9 @@ const char *synor_settings(const char *s){static char *saved;if(s){free(saved);s
             event=events.get(timeout=20)
             if event.get('id')!=identifier:continue
             result.append(event)
-            if event.get('done') or event.get('error') or event.get('settings'):return result
+            if event.get('done') or event.get('error') or event.get('settings') or event.get('models'):return result
     try:
-        send({'type':'settings-save','id':'settings','settings':{'BaseUrl':f'http://127.0.0.1:{server.server_port}/v1','Model':'test','WorkingDirectory':str(root)}})
+        send({'type':'settings-save','id':'settings','settings':{'ApiMode':'ChatCompletions','BaseUrl':f'http://127.0.0.1:{server.server_port}/v1','Model':'test','WorkingDirectory':str(root)}})
         assert 'settings' in collect('settings')[-1]
         for name in ['normal','invalid-test','length-test','fetch-test','auth-test']:
             send({'type':'chat','id':name,'messages':[{'role':'user','content':name}]})
@@ -137,5 +143,17 @@ const char *synor_settings(const char *s){static char *saved;if(s){free(saved);s
         result=collect('translation')
         assert result[-1].get('done') and 'tools' not in requests[-1]
         print('PASS translation does not expose tools',flush=True)
+        send({'type':'models-load','id':'models','baseUrl':f'http://127.0.0.1:{server.server_port}/v1','apiKey':'','userAgent':''})
+        result=collect('models')
+        assert result[-1].get('models')==['alpha-model','beta-model'], result[-1]
+        print('PASS models-load lists models without touching settings',flush=True)
+        send({'type':'models-load','id':'models-denied','baseUrl':f'http://127.0.0.1:{server.server_port}/v1','apiKey':'bad-key'})
+        result=collect('models-denied')
+        assert 'HTTP 401' in result[-1].get('error',''), result[-1]
+        print('PASS models-load reports auth failure',flush=True)
+        send({'type':'models-load','id':'models-bad-url','baseUrl':'not-a-url'})
+        result=collect('models-bad-url')
+        assert '基础地址' in result[-1].get('error',''), result[-1]
+        print('PASS models-load validates base url',flush=True)
     finally:
         process.terminate();process.wait(timeout=5);server.shutdown()

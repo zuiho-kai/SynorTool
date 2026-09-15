@@ -121,7 +121,7 @@ public sealed class OpenAiResponsesProvider : IAiProvider
                     {
                         var input = Sse.Long(usage, "input_tokens");
                         var outputTokens = Sse.Long(usage, "output_tokens");
-                        yield return new AiUsage(input, outputTokens, Sse.Long(usage, "total_tokens") == 0 ? input + outputTokens : Sse.Long(usage, "total_tokens"));
+                        yield return new AiUsage(input, outputTokens, Sse.Long(usage, "total_tokens") == 0 ? input + outputTokens : Sse.Long(usage, "total_tokens"), Sse.Cached(usage));
                     }
                     yield return new AiCompleted(AiFinishReason.Stop);
                 }
@@ -129,7 +129,7 @@ public sealed class OpenAiResponsesProvider : IAiProvider
                 {
                     var input = Sse.Long(genericUsage, "input_tokens");
                     var output = Sse.Long(genericUsage, "output_tokens");
-                    yield return new AiUsage(input, output, Sse.Long(genericUsage, "total_tokens"));
+                    yield return new AiUsage(input, output, Sse.Long(genericUsage, "total_tokens"), Sse.Cached(genericUsage));
                 }
             }
         }
@@ -195,7 +195,7 @@ public sealed class OpenAiChatCompletionsProvider : IAiProvider
                 var root = document.RootElement;
                 if (root.TryGetProperty("error", out var error)) { yield return new AiError(error.ToString()); continue; }
                 if (root.TryGetProperty("usage", out var usage) && usage.ValueKind == JsonValueKind.Object)
-                    yield return new AiUsage(Sse.Long(usage, "prompt_tokens"), Sse.Long(usage, "completion_tokens"), Sse.Long(usage, "total_tokens"));
+                    yield return new AiUsage(Sse.Long(usage, "prompt_tokens"), Sse.Long(usage, "completion_tokens"), Sse.Long(usage, "total_tokens"), Sse.Cached(usage));
                 if (!root.TryGetProperty("choices", out var choices) || choices.GetArrayLength() == 0) continue;
                 var choice = choices[0];
                 var finish = choice.TryGetProperty("finish_reason", out var finishProperty) ? Sse.Finish(Sse.String(choice, "finish_reason")) : AiFinishReason.Unknown;

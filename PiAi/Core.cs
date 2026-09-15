@@ -31,7 +31,7 @@ public sealed record AiReasoningDelta(string Text) : AiEvent;
 public sealed record AiToolCallDelta(int Index, string? CallId, string? Name, string? Arguments) : AiEvent;
 /// <summary>Responses 的 reasoning 输出项；store:false 时必须原样回传才能继续工具循环。</summary>
 public sealed record AiReasoningItem(JsonElement Element) : AiEvent;
-public sealed record AiUsage(long InputTokens, long OutputTokens, long TotalTokens) : AiEvent;
+public sealed record AiUsage(long InputTokens, long OutputTokens, long TotalTokens, long? CachedTokens = null) : AiEvent;
 public sealed record AiCompleted(AiFinishReason FinishReason = AiFinishReason.Unknown) : AiEvent;
 public sealed record AiError(string Message) : AiEvent;
 
@@ -71,6 +71,22 @@ internal static class Sse
 
     internal static long Long(JsonElement value, string name)
         => value.TryGetProperty(name, out var property) && property.TryGetInt64(out var result) ? result : 0;
+
+    /// <summary>
+    /// 缓存命中的输入 Token：兼容 OpenAI 的 prompt/input_tokens_details.cached_tokens 与 Anthropic 风格的 cache_read_input_tokens。
+    /// 没有任何相关字段时返回 null，让前端区分“服务端未上报”和“命中为 0”。
+    /// </summary>
+    internal static long? Cached(JsonElement usage)
+    {
+        if (usage.ValueKind != JsonValueKind.Object) return null;
+        if (Detail(usage, "prompt_tokens_details", "cached_tokens") is { } chatCompletions) return chatCompletions;
+        if (Detail(usage, "input_tokens_details", "cached_tokens") is { } responses) return responses;
+        return usage.TryGetProperty("cache_read_input_tokens", out var value) && value.TryGetInt64(out var read) ? read : null;
+    }
+
+    private static long? Detail(JsonElement usage, string container, string name)
+        => usage.TryGetProperty(container, out var details) && details.ValueKind == JsonValueKind.Object
+            && details.TryGetProperty(name, out var value) && value.TryGetInt64(out var result) ? result : null;
 
     internal static AiFinishReason Finish(string? value) => value?.ToLowerInvariant() switch
     {

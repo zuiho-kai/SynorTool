@@ -17,7 +17,7 @@ app="$stage/Synor.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources/Web" "$stage/Synor.iconset"
 dotnet publish "$root/SynorTool.csproj" -c Release -r osx-arm64 --self-contained true -o "$app/Contents/MacOS"
 cp "$root/bin/Release/net10.0/osx-arm64/libSynorPanel.dylib" "$app/Contents/MacOS/"
-cp "$root/Web/dist/index.html" "$root/Web/dist/translation.html" "$app/Contents/Resources/Web/"
+cp "$root/Web/dist/index.html" "$root/Web/dist/translation.html" "$root/Web/dist/settings.html" "$app/Contents/Resources/Web/"
 mv "$app/Contents/MacOS/Assets" "$app/Contents/Resources/Assets"
 for size in 16 32 128 256 512; do
     sips -z "$size" "$size" "$root/Assets/BrandIcon.png" --out "$stage/Synor.iconset/icon_${size}x${size}.png" >/dev/null

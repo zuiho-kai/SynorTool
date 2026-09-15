@@ -20,6 +20,16 @@ internal static class WebFetch
     { Timeout = Timeout.InfiniteTimeSpan };
 
     /// <summary>
+    /// 建立连接（DNS、TCP、TLS）并等待首个响应头的最长时间；超时后立即结束，避免代理或目标无响应时干等。
+    /// </summary>
+    private static readonly TimeSpan HeaderTimeout = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// 单次抓取的总时间上限，覆盖各次重定向和正文下载。
+    /// </summary>
+    private static readonly TimeSpan TotalTimeout = TimeSpan.FromSeconds(30);
+
+    /// <summary>
     /// 获取 HTTP(S) 文本资源，限制下载大小、等待时间和返回长度。
     /// </summary>
     /// <param name="url">目标网页地址。</param>
@@ -28,7 +38,7 @@ internal static class WebFetch
     internal static async Task<string> FetchAsync(string url, CancellationToken token)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
-        timeout.CancelAfter(TimeSpan.FromSeconds(30));
+        timeout.CancelAfter(TotalTimeout);
         try
         {
             var uri = new Uri(url, UriKind.Absolute);
@@ -39,7 +49,19 @@ internal static class WebFetch
                 using var request = new HttpRequestMessage(HttpMethod.Get, uri);
                 request.Headers.UserAgent.ParseAdd("Synor/1.0");
                 request.Headers.Accept.ParseAdd("text/markdown, text/html;q=0.9, text/plain;q=0.8, application/json;q=0.7");
-                using var response = await Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
+                // 连接和首个响应头单独限时：代理 fake-IP 或目标无响应时不必等到 30 秒总超时。
+                using var headers = CancellationTokenSource.CreateLinkedTokenSource(timeout.Token);
+                headers.CancelAfter(HeaderTimeout);
+                HttpResponseMessage message;
+                try
+                {
+                    message = await Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, headers.Token);
+                }
+                catch (OperationCanceledException) when (!timeout.IsCancellationRequested && !token.IsCancellationRequested)
+                {
+                    throw new TimeoutException($"web_fetch 连接或等待响应头超过 {HeaderTimeout.TotalSeconds:0} 秒，已停止请求。");
+                }
+                using var response = message;
                 if ((int)response.StatusCode is 301 or 302 or 303 or 307 or 308)
                 {
                     uri = new Uri(uri, response.Headers.Location ?? throw new HttpRequestException("重定向响应缺少 Location。"));
@@ -92,7 +114,7 @@ internal static class WebFetch
         }
         catch (OperationCanceledException) when (!token.IsCancellationRequested)
         {
-            throw new TimeoutException("web_fetch 超过 30 秒，已停止请求。");
+            throw new TimeoutException($"web_fetch 超过 {TotalTimeout.TotalSeconds:0} 秒，已停止请求。");
         }
     }
 

@@ -1,10 +1,13 @@
 #import <AppKit/AppKit.h>
 #import <WebKit/WebKit.h>
-#import <Security/Security.h>
 #import <ApplicationServices/ApplicationServices.h>
 
 static void (*chatRequest)(const char *);
 static NSMapTable<NSString *, WKWebView *> *requestViews;
+static NSString *backgroundTranslationID;
+// 后台翻译由原生直接发起，没有注册网页视图，因此不能依赖单独一条 apiMessages 事件，
+// 而是在这里累积流式正文，结束时统一交给通知写回前台应用的输入框。
+static NSMutableString *backgroundTranslationText;
 
 void synor_chat_event(const char *json) {
     NSString *payload = [NSString stringWithUTF8String:json];
@@ -12,42 +15,25 @@ void synor_chat_event(const char *json) {
         NSDictionary *event = [NSJSONSerialization JSONObjectWithData:[payload dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
         NSString *requestID = event[@"id"];
         if (!requestID) return;
+        if (backgroundTranslationID && [requestID isEqual:backgroundTranslationID]) {
+            if ([event[@"text"] isKindOfClass:NSString.class]) {
+                if (!backgroundTranslationText) backgroundTranslationText = [NSMutableString new];
+                [backgroundTranslationText appendString:event[@"text"]];
+            }
+            if (event[@"done"] || event[@"error"]) {
+                NSString *result = backgroundTranslationText.length ? backgroundTranslationText : nil;
+                backgroundTranslationText = nil;
+                backgroundTranslationID = nil;
+                if (result.length) [[NSNotificationCenter defaultCenter] postNotificationName:@"SynorBackgroundTranslationDone" object:result];
+            }
+            // 后台翻译的所有事件都不转发给网页，避免出现在聊天或翻译面板里。
+            return;
+        }
         WKWebView *view = [requestViews objectForKey:requestID];
-        if (event[@"done"] || event[@"error"] || event[@"settings"]) [requestViews removeObjectForKey:requestID];
+        if (event[@"done"] || event[@"error"] || event[@"settings"] || event[@"models"]) [requestViews removeObjectForKey:requestID];
         [view callAsyncJavaScript:@"window.dispatchEvent(new CustomEvent('synor-chat', {detail: JSON.parse(payload)}));"
             arguments:@{@"payload":payload} inFrame:nil inContentWorld:WKContentWorld.pageWorld completionHandler:nil];
     });
-}
-
-// 配置和密钥一起保存在当前用户的钥匙串，不写入网页存储或项目文件。
-const char *synor_settings(const char *json) {
-    static NSString *result;
-    NSDictionary *query = @{(__bridge id)kSecClass:(__bridge id)kSecClassGenericPassword,
-        (__bridge id)kSecAttrService:@"SynorTool.AI", (__bridge id)kSecAttrAccount:@"default"};
-    OSStatus status;
-    NSData *data;
-    if (json) {
-        data = [[NSString stringWithUTF8String:json] dataUsingEncoding:NSUTF8StringEncoding];
-        status = SecItemUpdate((__bridge CFDictionaryRef)query,
-            (__bridge CFDictionaryRef)@{(__bridge id)kSecValueData:data});
-        if (status == errSecItemNotFound) {
-            NSMutableDictionary *item = [query mutableCopy];
-            item[(__bridge id)kSecValueData] = data;
-            status = SecItemAdd((__bridge CFDictionaryRef)item, NULL);
-        }
-    } else {
-        NSMutableDictionary *lookup = [query mutableCopy];
-        lookup[(__bridge id)kSecReturnData] = @YES;
-        CFTypeRef value = NULL;
-        status = SecItemCopyMatching((__bridge CFDictionaryRef)lookup, &value);
-        if (status == errSecSuccess) data = CFBridgingRelease(value);
-        if (status == errSecItemNotFound) status = errSecSuccess;
-    }
-    NSDictionary *response = status == errSecSuccess
-        ? @{@"settings": data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] ?: NSNull.null : NSNull.null}
-        : @{@"error":[NSString stringWithFormat:@"无法访问钥匙串（%d），配置未保存。", (int)status]};
-    result = [[NSString alloc] initWithData:[NSJSONSerialization dataWithJSONObject:response options:0 error:nil] encoding:NSUTF8StringEncoding];
-    return result.UTF8String;
 }
 
 @interface SynorPanel : NSPanel
@@ -89,6 +75,226 @@ const char *synor_settings(const char *json) {
 }
 @end
 
+// 无选区时按 ⌘C 会复制整行的编辑器（VSCode 的 emptySelectionClipboard 等），
+// 模拟复制的结果和真实选区无法从剪贴板区分，需要额外判断。
+static NSSet<NSString *> *SynorLineCopyBundleIdentifiers(void) {
+    static NSSet<NSString *> *identifiers;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        identifiers = [NSSet setWithArray:@[
+            @"com.microsoft.VSCode",
+            @"com.microsoft.VSCodeInsiders",
+            @"com.visualstudio.code.oss",
+            @"com.vscodium",
+            @"com.todesktop.230313mzl4w4u92", // Cursor
+            @"com.exafunction.windsurf",
+            @"dev.zed.Zed",
+            @"com.sublimetext.4",
+            @"com.sublimetext.3",
+        ]];
+    });
+    return identifiers;
+}
+// 单行且以换行结尾的文本与“无选区复制整行”的结果无法区分，不作为可翻译的选区。
+static BOOL SynorCopyLooksLikeWholeLine(NSString *text) {
+    NSUInteger contentLength = text.length;
+    if (!contentLength) return NO;
+    if ([text hasSuffix:@"\r\n"]) contentLength -= 2;
+    else if ([text hasSuffix:@"\n"] || [text hasSuffix:@"\r"]) contentLength -= 1;
+    else return NO;
+    return [text rangeOfCharacterFromSet:NSCharacterSet.newlineCharacterSet options:0
+        range:NSMakeRange(0, contentLength)].location == NSNotFound;
+}
+
+typedef struct {
+    BOOL secure;          // 安全输入框，禁止读取选区
+    BOOL apiAvailable;    // 元素对选区属性有响应，空选区才可信
+    BOOL contentExposed;  // 元素暴露了完整文本（编辑器处于屏幕阅读器模式，如 VSCode）
+    CFAbsoluteTime deadline;  // 遍历子元素/祖先的时限，避免阻塞主线程
+} SynorSelectionProbe;
+
+// 参数化属性可能返回普通字符串或富文本，统一取纯文本。
+static NSString *SynorPlainTextFromValue(CFTypeRef value) {
+    if (!value) return @"";
+    if (CFGetTypeID(value) == CFStringGetTypeID()) return (__bridge NSString *)value;
+    if (CFGetTypeID(value) == CFAttributedStringGetTypeID()) return [(__bridge NSAttributedString *)value string];
+    return @"";
+}
+
+// 读取单个元素的选区：AXSelectedText → Text Marker → 选区范围参数化属性 → AXValue 按范围切片。
+static NSString *SynorSelectionTextFromElement(AXUIElementRef element, SynorSelectionProbe *probe) {
+    CFTypeRef subrole = NULL;
+    if (AXUIElementCopyAttributeValue(element, kAXSubroleAttribute, &subrole) == kAXErrorSuccess && subrole) {
+        if (CFEqual(subrole, kAXSecureTextFieldSubrole)) probe->secure = YES;
+        CFRelease(subrole);
+    }
+    if (probe->secure) return @"";
+
+    CFTypeRef selected = NULL;
+    AXError selectedError = AXUIElementCopyAttributeValue(element, kAXSelectedTextAttribute, &selected);
+    if (selectedError == kAXErrorSuccess) {
+        probe->apiAvailable = YES;
+        NSString *text = selected ? [SynorPlainTextFromValue(selected) copy] : @"";
+        if (selected) CFRelease(selected);
+        if (text.length) return text;
+    }
+
+    // 网页与 WKWebView/Chromium 常用 Text Marker 报告选区。
+    CFTypeRef markerRange = NULL;
+    if (AXUIElementCopyAttributeValue(element, CFSTR("AXSelectedTextMarkerRange"), &markerRange) == kAXErrorSuccess && markerRange) {
+        probe->apiAvailable = YES;
+        CFStringRef markerAttributes[] = {CFSTR("AXStringForTextMarkerRange"), CFSTR("AXAttributedStringForTextMarkerRange")};
+        for (size_t index = 0; index < sizeof(markerAttributes) / sizeof(markerAttributes[0]); index++) {
+            CFTypeRef markerText = NULL;
+            if (AXUIElementCopyParameterizedAttributeValue(element, markerAttributes[index], markerRange, &markerText) == kAXErrorSuccess && markerText) {
+                NSString *text = [SynorPlainTextFromValue(markerText) copy];
+                CFRelease(markerText);
+                if (text.length) {
+                    CFRelease(markerRange);
+                    return text;
+                }
+            }
+        }
+        CFRelease(markerRange);
+    }
+
+    // 部分应用只暴露选区范围，通过参数化属性或整段文本切片获取对应文字。
+    CFTypeRef range = NULL;
+    if (AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute, &range) == kAXErrorSuccess && range) {
+        probe->apiAvailable = YES;
+        if (CFGetTypeID(range) == AXValueGetTypeID() && AXValueGetType((AXValueRef)range) == kAXValueCFRangeType) {
+            CFRange selectedRange;
+            if (AXValueGetValue((AXValueRef)range, kAXValueCFRangeType, &selectedRange) && selectedRange.length > 0) {
+                CFStringRef rangeAttributes[] = {kAXStringForRangeParameterizedAttribute, kAXAttributedStringForRangeParameterizedAttribute};
+                for (size_t index = 0; index < sizeof(rangeAttributes) / sizeof(rangeAttributes[0]); index++) {
+                    CFTypeRef rangeText = NULL;
+                    if (AXUIElementCopyParameterizedAttributeValue(element, rangeAttributes[index], range, &rangeText) == kAXErrorSuccess && rangeText) {
+                        NSString *text = [SynorPlainTextFromValue(rangeText) copy];
+                        CFRelease(rangeText);
+                        if (text.length) {
+                            CFRelease(range);
+                            return text;
+                        }
+                    }
+                }
+                CFTypeRef value = NULL;
+                if (AXUIElementCopyAttributeValue(element, kAXValueAttribute, &value) == kAXErrorSuccess && value && CFGetTypeID(value) == CFStringGetTypeID()) {
+                    NSString *fullText = (__bridge NSString *)value;
+                    // 选区范围按 UTF-16 偏移计算。
+                    NSRange slice = NSMakeRange((NSUInteger)selectedRange.location, (NSUInteger)selectedRange.length);
+                    NSString *text = NSMaxRange(slice) <= fullText.length ? [[fullText substringWithRange:slice] copy] : @"";
+                    CFRelease(value);
+                    if (text.length) {
+                        CFRelease(range);
+                        return text;
+                    }
+                } else if (value) {
+                    CFRelease(value);
+                }
+            }
+        }
+        CFRelease(range);
+    }
+    return @"";
+}
+
+// 焦点元素：找到文字即返回；没有文字时额外读 AXValue，判断“空选区”是否可信。
+static NSString *SynorSelectionTextFromFocusedElement(AXUIElementRef element, SynorSelectionProbe *probe) {
+    NSString *text = SynorSelectionTextFromElement(element, probe);
+    if (!text.length && !probe->secure) {
+        CFTypeRef value = NULL;
+        if (AXUIElementCopyAttributeValue(element, kAXValueAttribute, &value) == kAXErrorSuccess && value) {
+            probe->contentExposed = SynorPlainTextFromValue(value).length > 0;
+            CFRelease(value);
+        }
+    }
+    return text;
+}
+
+// 网页里焦点元素往往只是容器，真正持有选区的节点在子树里；限制深度与节点数，避免在主线程上长时间等待。
+static NSString *SynorSelectionTextInSubtree(AXUIElementRef element, NSInteger depth, NSInteger *budget, SynorSelectionProbe *probe) {
+    if (depth <= 0 || *budget <= 0 || probe->secure || CFAbsoluteTimeGetCurrent() > probe->deadline) return @"";
+    CFTypeRef childrenValue = NULL;
+    if (AXUIElementCopyAttributeValue(element, kAXChildrenAttribute, &childrenValue) != kAXErrorSuccess || !childrenValue) return @"";
+    if (CFGetTypeID(childrenValue) != CFArrayGetTypeID()) {
+        CFRelease(childrenValue);
+        return @"";
+    }
+    CFArrayRef children = (CFArrayRef)childrenValue;
+    NSString *text = @"";
+    for (CFIndex index = 0; index < CFArrayGetCount(children) && *budget > 0 && !probe->secure; index++) {
+        CFTypeRef childValue = (CFTypeRef)CFArrayGetValueAtIndex(children, index);
+        if (CFGetTypeID(childValue) != AXUIElementGetTypeID()) continue;
+        *budget -= 1;
+        AXUIElementRef child = (AXUIElementRef)childValue;
+        text = SynorSelectionTextFromElement(child, probe);
+        if (!text.length) text = SynorSelectionTextInSubtree(child, depth - 1, budget, probe);
+        if (text.length || probe->secure) break;
+    }
+    CFRelease(childrenValue);
+    return text;
+}
+
+// 跨节点的选区可能只由祖先（通常是 AXWebArea）报告，沿父链向上回溯若干层。
+static NSString *SynorSelectionTextInAncestors(AXUIElementRef element, SynorSelectionProbe *probe) {
+    const int maxLevels = 10;
+    AXUIElementRef current = (AXUIElementRef)CFRetain(element);
+    NSString *text = @"";
+    for (int level = 0; level < maxLevels && !probe->secure && CFAbsoluteTimeGetCurrent() <= probe->deadline; level++) {
+        CFTypeRef parentValue = NULL;
+        AXError error = AXUIElementCopyAttributeValue(current, kAXParentAttribute, &parentValue);
+        CFRelease(current);
+        current = NULL;
+        if (error != kAXErrorSuccess || !parentValue) break;
+        if (CFGetTypeID(parentValue) != AXUIElementGetTypeID()) {
+            CFRelease(parentValue);
+            break;
+        }
+        current = (AXUIElementRef)parentValue;
+        text = SynorSelectionTextFromElement(current, probe);
+        if (text.length) break;
+    }
+    if (current) CFRelease(current);
+    return text;
+}
+
+// 只有可编辑控件（输入框、contenteditable）才适合后台翻译后就地回填；
+// 只有真正的输入控件才适合后台翻译后就地回填；静态文本（AI 回复、网页正文）写不进去，应改走翻译面板。
+// 注意：Codex 的容器节点（AXGroup 等）会把 AXValue / AXSelectedText 的 IsAttributeSettable 报成 true，
+// 属于假阳性，这里不能采信；只认 AXEditable 与文字角色。
+static BOOL SynorElementIsEditable(AXUIElementRef element) {
+    // 可编辑的文字角色集合；命中即认为适合写回。
+    NSSet<NSString *> *editableRoles = [NSSet setWithArray:@[ @"AXTextField", @"AXTextArea", @"AXComboBox" ]];
+    AXUIElementRef current = (AXUIElementRef)CFRetain(element);
+    BOOL editable = NO;
+    for (int level = 0; level < 4 && current; level++) {
+        CFTypeRef value = NULL;
+        if (AXUIElementCopyAttributeValue(current, CFSTR("AXEditable"), &value) == kAXErrorSuccess && value) {
+            if (CFGetTypeID(value) == CFBooleanGetTypeID()) editable = CFBooleanGetValue((CFBooleanRef)value);
+            CFRelease(value);
+        }
+        if (!editable) {
+            CFTypeRef role = NULL;
+            if (AXUIElementCopyAttributeValue(current, kAXRoleAttribute, &role) == kAXErrorSuccess && role) {
+                editable = [editableRoles containsObject:(__bridge NSString *)role];
+                CFRelease(role);
+            }
+        }
+        if (editable) break;
+        CFTypeRef parent = NULL;
+        AXError error = AXUIElementCopyAttributeValue(current, kAXParentAttribute, &parent);
+        CFRelease(current);
+        current = NULL;
+        if (error != kAXErrorSuccess || !parent || CFGetTypeID(parent) != AXUIElementGetTypeID()) {
+            if (parent) CFRelease(parent);
+            break;
+        }
+        current = (AXUIElementRef)parent;
+    }
+    if (current) CFRelease(current);
+    return editable;
+}
+
 @interface PanelController : NSObject <NSApplicationDelegate, WKScriptMessageHandler, WKNavigationDelegate>
 @property(strong) SynorPanel *panel;
 @property(strong) NSURL *pageURL;
@@ -96,18 +302,55 @@ const char *synor_settings(const char *json) {
 @property(strong) NSMenu *statusMenu;
 @property(strong) id globalKeyMonitor;
 @property(strong) id localKeyMonitor;
-@property(strong) NSTimer *optionTimer;
 @property BOOL optionHeld;
+@property NSTimeInterval lastOptionTap;
 @property(strong) NSTimer *selectionTimer;
 @property BOOL selectionIsSecure;
+@property BOOL selectionAPIAvailable;
+@property BOOL selectionContentExposed;
 @property(strong) SynorPanel *translationPanel;
 @property(strong) NSURL *translationURL;
 @property BOOL translationReady;
 @property(copy) NSString *pendingTranslation;
+@property AXUIElementRef backgroundElement;
+@property(copy) NSString *backgroundOriginal;
+@property NSRange backgroundSelection;
+@property BOOL backgroundHasSelection;
+@property(strong) SynorPanel *settingsPanel;
+@property(strong) NSURL *settingsURL;
 @end
 @implementation PanelController
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     (void)notification;
+    __weak PanelController *backgroundWeakSelf = self;
+    [[NSNotificationCenter defaultCenter] addObserverForName:@"SynorBackgroundTranslationDone" object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
+        PanelController *owner = backgroundWeakSelf; NSString *translated = note.object;
+        if (!owner || !owner.backgroundElement || !translated.length) return;
+        CFTypeRef current = NULL;
+        NSString *currentText = nil;
+        if (AXUIElementCopyAttributeValue(owner.backgroundElement, kAXValueAttribute, &current) == kAXErrorSuccess && current && CFGetTypeID(current) == CFStringGetTypeID()) currentText = (__bridge NSString *)current;
+        // 原文已变化（用户继续输入）时不覆盖，避免把新内容冲掉；读不到原值时按可写处理。
+        BOOL unchanged = owner.backgroundOriginal == nil || (currentText && [currentText isEqual:owner.backgroundOriginal]);
+        if (unchanged && currentText) {
+            NSRange selection = owner.backgroundSelection;
+            if (owner.backgroundHasSelection && NSMaxRange(selection) <= currentText.length) {
+                // 只替换选中的那一段，保留输入框里的其它内容，并把光标定位到译文末尾。
+                NSString *updated = [currentText stringByReplacingCharactersInRange:selection withString:translated];
+                if (AXUIElementSetAttributeValue(owner.backgroundElement, kAXValueAttribute, (__bridge CFStringRef)updated) == kAXErrorSuccess) {
+                    CFRange caret = CFRangeMake(selection.location, translated.length);
+                    AXValueRef range = AXValueCreate(kAXValueCFRangeType, &caret);
+                    if (range) { AXUIElementSetAttributeValue(owner.backgroundElement, kAXSelectedTextRangeAttribute, range); CFRelease(range); }
+                }
+            } else {
+                // 没有选区范围信息时退化为整框替换（与旧行为一致）。
+                AXUIElementSetAttributeValue(owner.backgroundElement, kAXValueAttribute, (__bridge CFStringRef)translated);
+            }
+        } else if (unchanged) {
+            // 应用不暴露 AXValue（Chromium 未建树等）时，尝试直接替换当前选区。
+            AXUIElementSetAttributeValue(owner.backgroundElement, kAXSelectedTextAttribute, (__bridge CFStringRef)translated);
+        }
+        if (current) CFRelease(current); CFRelease(owner.backgroundElement); owner.backgroundElement = NULL; owner.backgroundOriginal = nil; owner.backgroundHasSelection = NO;
+    }];
     self.panel = [[SynorPanel alloc] initWithContentRect:NSMakeRect(0, 0, 680, 740)
         styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel | NSWindowStyleMaskResizable
         backing:NSBackingStoreBuffered defer:NO];
@@ -149,9 +392,11 @@ const char *synor_settings(const char *json) {
     show.target = self;
     NSMenuItem *translate = [self.statusMenu addItemWithTitle:@"快捷翻译" action:@selector(showTranslation:) keyEquivalent:@""];
     translate.target = self;
+    NSMenuItem *settings = [self.statusMenu addItemWithTitle:@"AI 配置…" action:@selector(showSettings:) keyEquivalent:@""];
+    settings.target = self;
     NSMenuItem *hide = [self.statusMenu addItemWithTitle:@"隐藏窗口" action:@selector(hideWindow:) keyEquivalent:@""];
     hide.target = self;
-    NSMenuItem *shortcut = [self.statusMenu addItemWithTitle:@"启用长按 Option 快捷键…" action:@selector(requestShortcutPermission:) keyEquivalent:@""];
+    NSMenuItem *shortcut = [self.statusMenu addItemWithTitle:@"启用连按两次 Option 快捷键…" action:@selector(requestShortcutPermission:) keyEquivalent:@""];
     shortcut.target = self;
     [self.statusMenu addItem:NSMenuItem.separatorItem];
     NSMenuItem *quit = [self.statusMenu addItemWithTitle:@"退出 Synor" action:@selector(terminate:) keyEquivalent:@"q"];
@@ -223,41 +468,49 @@ const char *synor_settings(const char *json) {
     if (!AXIsProcessTrusted()) {
         AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)@{(__bridge id)kAXTrustedCheckOptionPrompt:@YES});
     }
-    [self.panel center];
+    [self restoreFrameForWindow:self.panel name:@"SynorMainWindow"];
     [self.panel makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
 }
-// 只观察按键，不拦截、不记录输入；组合键或鼠标操作会取消本次长按。
+// 只观察按键，不拦截、不记录输入；单独连按两次 Option 触发，其它组合键或鼠标操作会取消本次计数。
 - (void)handleOptionEvent:(NSEvent *)event {
     NSEventModifierFlags mask = NSEventModifierFlagOption | NSEventModifierFlagCommand |
         NSEventModifierFlagControl | NSEventModifierFlagShift | NSEventModifierFlagFunction;
     NSEventModifierFlags flags = event.modifierFlags & mask;
-    if (!(flags & NSEventModifierFlagOption)) {
+    if (event.type != NSEventTypeFlagsChanged) {
+        // 普通按键或鼠标操作会打断连按，取消已有计数。
         self.optionHeld = NO;
-        [self.optionTimer invalidate];
-        self.optionTimer = nil;
+        self.lastOptionTap = 0;
         return;
     }
-    if (event.type != NSEventTypeFlagsChanged || flags != NSEventModifierFlagOption) {
-        self.optionHeld = YES;
-        [self.optionTimer invalidate];
-        self.optionTimer = nil;
+    if (flags != NSEventModifierFlagOption) {
+        self.optionHeld = (flags & NSEventModifierFlagOption) != 0;
+        // 只有组合了其它修饰键才取消计数；单纯松开保留时间戳，等待第二次按下。
+        if (flags) self.lastOptionTap = 0;
         return;
     }
-    if (self.optionHeld) return;
+    if (self.optionHeld) return;  // 按住期间系统会重复发送，只认第一次按下
     self.optionHeld = YES;
-    __weak PanelController *weakSelf = self;
-    self.optionTimer = [NSTimer timerWithTimeInterval:0.5 repeats:NO block:^(NSTimer *timer) {
-        (void)timer;
-        PanelController *owner = weakSelf;
-        if (owner.optionHeld && (NSEvent.modifierFlags & mask) == NSEventModifierFlagOption) {
-            NSString *selection = [owner selectedTextFromFrontmostApp];
-            if (selection.length) [owner presentTranslationText:selection];
-            else [owner copySelectionOrShowChat];
-        }
-        owner.optionTimer = nil;
-    }];
-    [NSRunLoop.mainRunLoop addTimer:self.optionTimer forMode:NSRunLoopCommonModes];
+    NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+    if (self.lastOptionTap > 0 && now - self.lastOptionTap <= MAX(NSEvent.doubleClickInterval, 0.35)) {
+        self.lastOptionTap = 0;
+        [self triggerOptionShortcut];
+        return;
+    }
+    self.lastOptionTap = now;
+}
+// 连按两次 Option 后执行：有可读选区则翻译，否则复制选区或显示聊天窗口。
+- (void)triggerOptionShortcut {
+    NSString *selection = [self selectedTextFromFrontmostApp];
+    NSRunningApplication *app = NSWorkspace.sharedWorkspace.frontmostApplication;
+    AXUIElementRef focused = NULL;
+    if (selection.length && app && app.processIdentifier != NSProcessInfo.processInfo.processIdentifier) {
+        AXUIElementRef axApp = AXUIElementCreateApplication(app.processIdentifier);
+        if (AXUIElementCopyAttributeValue(axApp, kAXFocusedUIElementAttribute, (CFTypeRef *)&focused) == kAXErrorSuccess && [self beginBackgroundTranslationIfPossible:selection element:focused application:app]) { CFRelease(focused); CFRelease(axApp); return; }
+        if (focused) CFRelease(focused); CFRelease(axApp);
+    }
+    if (selection.length) [self presentTranslationText:selection];
+    else [self copySelectionOrShowChat];
 }
 - (void)refreshGlobalShortcut {
     if (!AXIsProcessTrusted()) {
@@ -287,54 +540,90 @@ const char *synor_settings(const char *json) {
 }
 - (void)applicationWillTerminate:(NSNotification *)notification {
     (void)notification;
-    [self.optionTimer invalidate];
     [self.selectionTimer invalidate];
+    // 退出前主动落盘，确保最后一次移动/缩放也被记住。
+    [self.panel saveFrameUsingName:@"SynorMainWindow"];
+    [self.translationPanel saveFrameUsingName:@"SynorTranslationWindow"];
+    [self.settingsPanel saveFrameUsingName:@"SynorSettingsWindow"];
     if (self.globalKeyMonitor) [NSEvent removeMonitor:self.globalKeyMonitor];
     if (self.localKeyMonitor) [NSEvent removeMonitor:self.localKeyMonitor];
 }
 - (NSString *)selectedTextFromFrontmostApp {
     self.selectionIsSecure = NO;
+    self.selectionAPIAvailable = NO;
+    self.selectionContentExposed = NO;
     NSRunningApplication *application = NSWorkspace.sharedWorkspace.frontmostApplication;
     if (!AXIsProcessTrusted() || !application || application.processIdentifier == NSProcessInfo.processInfo.processIdentifier) return @"";
     AXUIElementRef app = AXUIElementCreateApplication(application.processIdentifier);
     AXUIElementSetMessagingTimeout(app, 0.25);
-    CFTypeRef focused = NULL;
-    CFTypeRef selected = NULL;
-    CFTypeRef subrole = NULL;
+    SynorSelectionProbe probe = {NO, NO, NO, CFAbsoluteTimeGetCurrent() + 0.3};
     NSString *text = @"";
+    CFTypeRef focused = NULL;
     if (AXUIElementCopyAttributeValue(app, kAXFocusedUIElementAttribute, &focused) == kAXErrorSuccess &&
-        CFGetTypeID(focused) == AXUIElementGetTypeID()) {
-        AXUIElementCopyAttributeValue((AXUIElementRef)focused, kAXSubroleAttribute, &subrole);
-        BOOL secure = subrole && CFEqual(subrole, kAXSecureTextFieldSubrole);
-        self.selectionIsSecure = secure;
-        if (!secure && AXUIElementCopyAttributeValue((AXUIElementRef)focused, kAXSelectedTextAttribute, &selected) == kAXErrorSuccess &&
-            CFGetTypeID(selected) == CFStringGetTypeID()) text = [(__bridge NSString *)selected copy];
-        // 部分应用只暴露选区范围，通过参数化属性获取对应文字。
-        if (!secure && !text.length) {
-            CFTypeRef range = NULL;
-            CFTypeRef value = NULL;
-            if (AXUIElementCopyAttributeValue((AXUIElementRef)focused, kAXSelectedTextRangeAttribute, &range) == kAXErrorSuccess &&
-                CFGetTypeID(range) == AXValueGetTypeID() && AXValueGetType((AXValueRef)range) == kAXValueCFRangeType) {
-                CFRange selectedRange;
-                if (AXValueGetValue((AXValueRef)range, kAXValueCFRangeType, &selectedRange) && selectedRange.length > 0 &&
-                    AXUIElementCopyParameterizedAttributeValue((AXUIElementRef)focused, kAXStringForRangeParameterizedAttribute, range, &value) == kAXErrorSuccess &&
-                    CFGetTypeID(value) == CFStringGetTypeID()) text = [(__bridge NSString *)value copy];
-            }
-            if (value) CFRelease(value);
-            if (range) CFRelease(range);
+        focused && CFGetTypeID(focused) == AXUIElementGetTypeID()) {
+        text = SynorSelectionTextFromFocusedElement((AXUIElementRef)focused, &probe);
+        if (!text.length && !probe.secure) {
+            // 顺序与 selection-hook 一致：焦点元素 → 子树 → 祖先（跨节点选区由 AXWebArea 报告）。
+            NSInteger budget = 20;
+            text = SynorSelectionTextInSubtree((AXUIElementRef)focused, 2, &budget, &probe);
         }
+        if (!text.length && !probe.secure) text = SynorSelectionTextInAncestors((AXUIElementRef)focused, &probe);
+        CFRelease(focused);
     }
-    if (subrole) CFRelease(subrole);
-    if (selected) CFRelease(selected);
-    if (focused) CFRelease(focused);
+    self.selectionIsSecure = probe.secure;
+    self.selectionAPIAvailable = probe.apiAvailable;
+    self.selectionContentExposed = probe.contentExposed;
+    // Chromium/Electron 默认不构建辅助功能树：连选区属性都问不到时打开开关（幂等），
+    // 之后取词就能直接读 AX，不必再模拟 ⌘C。代价是目标应用会构建完整 AX 树。
+    if (!text.length && !probe.secure && !probe.apiAvailable) {
+        AXUIElementSetAttributeValue(app, CFSTR("AXEnhancedUserInterface"), kCFBooleanTrue);
+        AXUIElementSetAttributeValue(app, CFSTR("AXManualAccessibility"), kCFBooleanTrue);
+    }
     CFRelease(app);
     return text;
+}
+
+- (BOOL)beginBackgroundTranslationIfPossible:(NSString *)text element:(AXUIElementRef)element application:(NSRunningApplication *)application {
+    if (!text.length || !element || !application || ![application.bundleIdentifier isEqual:@"com.openai.codex"] || !chatRequest) return NO;
+    // 静态选区（例如 AI 回复正文）没有可写回的输入框，交给翻译面板处理。
+    if (!SynorElementIsEditable(element)) return NO;
+    if (self.backgroundElement) CFRelease(self.backgroundElement);
+    self.backgroundElement = (AXUIElementRef)CFRetain(element);
+    // 记录全框原值与选区范围：之后按范围做就地替换，而不是用译文覆盖整个输入框。
+    CFTypeRef value = NULL;
+    NSString *fullText = nil;
+    if (AXUIElementCopyAttributeValue(element, kAXValueAttribute, &value) == kAXErrorSuccess && value && CFGetTypeID(value) == CFStringGetTypeID()) fullText = [(__bridge NSString *)value copy];
+    if (value) CFRelease(value);
+    self.backgroundOriginal = fullText;
+    NSRange selection = NSMakeRange(NSNotFound, 0);
+    CFTypeRef range = NULL;
+    if (AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute, &range) == kAXErrorSuccess && range && CFGetTypeID(range) == AXValueGetTypeID()) {
+        CFRange selected = {0, 0};
+        if (AXValueGetValue((AXValueRef)range, kAXValueCFRangeType, &selected)) selection = NSMakeRange((NSUInteger)selected.location, (NSUInteger)selected.length);
+    }
+    if (range) CFRelease(range);
+    self.backgroundSelection = selection;
+    self.backgroundHasSelection = selection.location != NSNotFound;
+    NSString *requestID = [NSUUID UUID].UUIDString;
+    backgroundTranslationText = nil;
+    backgroundTranslationID = requestID;
+    NSDictionary *body = @{ @"type": @"translate", @"id": requestID, @"text": text, @"target": @"English" };
+    NSData *data = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+    if (data) chatRequest([[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding].UTF8String);
+    return YES;
 }
 // 浏览器、微信等未提供 AX 选区时，通过应用自己的复制能力获取文本。
 - (void)copySelectionOrShowChat {
     if (self.selectionTimer) return;
     NSRunningApplication *source = NSWorkspace.sharedWorkspace.frontmostApplication;
     if (self.selectionIsSecure || !AXIsProcessTrusted() || !source || source.processIdentifier == NSProcessInfo.processInfo.processIdentifier) {
+        [self showWindow:nil];
+        return;
+    }
+    // 编辑器在无选区时会复制整行：AX 树确实暴露了内容（屏幕阅读器模式）时，才把“空选区”当真。
+    NSString *bundleIdentifier = source.bundleIdentifier ?: @"";
+    BOOL lineCopyRisk = [SynorLineCopyBundleIdentifiers() containsObject:bundleIdentifier];
+    if (self.selectionAPIAvailable && (!lineCopyRisk || self.selectionContentExposed)) {
         [self showWindow:nil];
         return;
     }
@@ -346,7 +635,7 @@ const char *synor_settings(const char *json) {
     self.selectionTimer = [NSTimer timerWithTimeInterval:0.05 repeats:YES block:^(NSTimer *timer) {
         PanelController *owner = weakSelf;
         if (!owner) { [timer invalidate]; return; }
-        // 长按达到阈值后立即读取；切换应用则取消，避免复制错误窗口。
+        // 触发后立即读取；切换应用则取消，避免复制错误窗口。
         if (NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier != source.processIdentifier || -started.timeIntervalSinceNow > 5) {
             [timer invalidate]; owner.selectionTimer = nil;
             return;
@@ -406,7 +695,8 @@ const char *synor_settings(const char *json) {
             }
         }
         [timer invalidate]; owner.selectionTimer = nil;
-        if (selection.length) [owner presentTranslationText:selection];
+        // 无选区时编辑器会复制整行，结果与“选中一整行”完全一致，只能按无选区处理。
+        if (selection.length && !(lineCopyRisk && SynorCopyLooksLikeWholeLine(selection))) [owner presentTranslationText:selection];
         else [owner showWindow:nil];
     }];
     [NSRunLoop.mainRunLoop addTimer:self.selectionTimer forMode:NSRunLoopCommonModes];
@@ -468,7 +758,7 @@ const char *synor_settings(const char *json) {
         self.translationPanel.chatView = web;
         [content addSubview:web];
         [web loadFileURL:self.translationURL allowingReadAccessToURL:self.translationURL.URLByDeletingLastPathComponent];
-        [self.translationPanel center];
+        [self restoreFrameForWindow:self.translationPanel name:@"SynorTranslationWindow"];
     }
     [NSApp activateIgnoringOtherApps:YES];
     [self.translationPanel makeKeyAndOrderFront:nil];
@@ -483,6 +773,111 @@ const char *synor_settings(const char *json) {
 - (void)showTranslation:(id)sender {
     (void)sender;
     [self presentTranslationText:[self selectedTextFromFrontmostApp]];
+}
+- (void)presentSettings {
+    if (!self.settingsPanel) {
+        self.settingsURL = [self.pageURL.URLByDeletingLastPathComponent URLByAppendingPathComponent:@"settings.html"];
+        self.settingsPanel = [[SynorPanel alloc] initWithContentRect:NSMakeRect(0, 0, 560, 720)
+            styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel | NSWindowStyleMaskResizable
+            backing:NSBackingStoreBuffered defer:NO];
+        self.settingsPanel.title = @"Synor · AI 配置";
+        self.settingsPanel.contentMinSize = NSMakeSize(460, 560);
+        self.settingsPanel.level = NSFloatingWindowLevel;
+        self.settingsPanel.opaque = NO;
+        self.settingsPanel.backgroundColor = NSColor.clearColor;
+        self.settingsPanel.hasShadow = YES;
+        self.settingsPanel.movableByWindowBackground = YES;
+        self.settingsPanel.hidesOnDeactivate = NO;
+        self.settingsPanel.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorFullScreenAuxiliary;
+        NSGlassEffectView *glass = [[NSGlassEffectView alloc] initWithFrame:NSMakeRect(0, 0, 560, 720)];
+        glass.style = NSGlassEffectViewStyleRegular;
+        glass.cornerRadius = 18;
+        glass.clipsToBounds = YES;
+        glass.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        NSView *content = [[NSView alloc] initWithFrame:glass.bounds];
+        content.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        glass.contentView = content;
+        self.settingsPanel.contentView = glass;
+        NSURL *iconURL = [[self.pageURL.URLByDeletingLastPathComponent URLByDeletingLastPathComponent]
+            URLByAppendingPathComponent:@"Assets/MenuBarIcon.png"];
+        NSImageView *logo = [[NSImageView alloc] initWithFrame:NSMakeRect(26, 674, 32, 32)];
+        logo.image = [[NSImage alloc] initWithContentsOfURL:iconURL];
+        logo.imageScaling = NSImageScaleProportionallyUpOrDown;
+        logo.autoresizingMask = NSViewMinYMargin;
+        logo.wantsLayer = YES;
+        logo.layer.cornerRadius = 8;
+        logo.layer.cornerCurve = kCACornerCurveContinuous;
+        logo.layer.masksToBounds = YES;
+        logo.accessibilityLabel = @"Synor 品牌标志";
+        [content addSubview:logo];
+        // 与主窗口使用同一套品牌标题，避免配置窗口看起来像另一个应用。
+        NSTextField *brand = [NSTextField labelWithString:@"SYNOR"];
+        brand.font = [NSFont systemFontOfSize:17 weight:NSFontWeightSemibold];
+        [brand sizeToFit];
+        brand.frame = NSMakeRect(66, 676 + (28 - NSHeight(brand.frame)) / 2, NSWidth(brand.frame), NSHeight(brand.frame));
+        brand.autoresizingMask = NSViewMinYMargin;
+        [content addSubview:brand];
+        NSTextField *subtitle = [NSTextField labelWithString:@"AI 配置"];
+        subtitle.font = [NSFont systemFontOfSize:12];
+        subtitle.textColor = NSColor.secondaryLabelColor;
+        [subtitle sizeToFit];
+        CGFloat subtitleX = NSMaxX(brand.frame) + 10;
+        subtitle.frame = NSMakeRect(subtitleX, NSMidY(brand.frame) - NSHeight(subtitle.frame) / 2, 520 - subtitleX, NSHeight(subtitle.frame));
+        subtitle.lineBreakMode = NSLineBreakByTruncatingTail;
+        subtitle.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+        [content addSubview:subtitle];
+        NSTextField *escapeHint = [NSTextField labelWithString:@"Esc 返回"];
+        escapeHint.font = [NSFont systemFontOfSize:11];
+        escapeHint.textColor = NSColor.secondaryLabelColor;
+        [escapeHint sizeToFit];
+        escapeHint.frame = NSMakeRect(540 - NSWidth(escapeHint.frame), NSMidY(brand.frame) - NSHeight(escapeHint.frame) / 2, NSWidth(escapeHint.frame), NSHeight(escapeHint.frame));
+        escapeHint.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
+        [content addSubview:escapeHint];
+        NSRect subtitleFrame = subtitle.frame;
+        subtitleFrame.size.width = NSMinX(escapeHint.frame) - 16 - NSMinX(subtitleFrame);
+        subtitle.frame = subtitleFrame;
+        WKWebViewConfiguration *configuration = [WKWebViewConfiguration new];
+        configuration.websiteDataStore = WKWebsiteDataStore.nonPersistentDataStore;
+        [configuration.userContentController addScriptMessageHandler:self name:@"synor"];
+        WKWebView *web = [[WKWebView alloc] initWithFrame:NSMakeRect(20, 20, 520, 640) configuration:configuration];
+        web.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        web.navigationDelegate = self;
+        [web setValue:@NO forKey:@"drawsBackground"];
+        web.underPageBackgroundColor = NSColor.clearColor;
+        self.settingsPanel.chatView = web;
+        [content addSubview:web];
+        [web loadFileURL:self.settingsURL allowingReadAccessToURL:self.settingsURL.URLByDeletingLastPathComponent];
+        [self restoreFrameForWindow:self.settingsPanel name:@"SynorSettingsWindow"];
+    }
+    [NSApp activateIgnoringOtherApps:YES];
+    [self.settingsPanel makeKeyAndOrderFront:nil];
+}
+- (void)showSettings:(id)sender {
+    (void)sender;
+    [self presentSettings];
+}
+- (NSURL *)localPageForWebView:(WKWebView *)webView {
+    if (self.translationPanel && webView == self.translationPanel.chatView) return self.translationURL;
+    if (self.settingsPanel && webView == self.settingsPanel.chatView) return self.settingsURL;
+    return self.pageURL;
+}
+// 各窗口共用：优先恢复上次的位置与大小；首次运行或保存位置已不在屏幕内时居中，并按最小尺寸收敛。
+- (void)restoreFrameForWindow:(NSWindow *)window name:(NSString *)name {
+    window.frameAutosaveName = name;
+    BOOL restored = [window setFrameUsingName:name];
+    NSSize minimum = window.contentMinSize;
+    NSRect frame = window.frame;
+    frame.size.width = MAX(NSWidth(frame), minimum.width);
+    frame.size.height = MAX(NSHeight(frame), minimum.height);
+    if (!NSEqualRects(frame, window.frame)) [window setFrame:frame display:NO];
+    if (!restored || ![self windowFrameOnVisibleScreen:window]) [window center];
+}
+// 保存的位置可能来自已拔掉的显示器，完全不在任何屏幕内时视为失效。
+- (BOOL)windowFrameOnVisibleScreen:(NSWindow *)window {
+    for (NSScreen *screen in NSScreen.screens) {
+        if (NSIntersectsRect(window.frame, screen.visibleFrame)) return YES;
+    }
+    return NO;
 }
 - (void)showWindow:(id)sender {
     (void)sender;
@@ -512,18 +907,26 @@ const char *synor_settings(const char *json) {
 }
 - (void)webView:(WKWebView *)webView decidePolicyForNavigationAction:(WKNavigationAction *)action
     decisionHandler:(void (^)(WKNavigationActionPolicy))decisionHandler {
-    NSURL *allowedURL = webView == self.translationPanel.chatView ? self.translationURL : self.pageURL;
     // 每个窗口只允许加载自己的本地页面。
-    decisionHandler([action.request.URL isEqual:allowedURL] ? WKNavigationActionPolicyAllow : WKNavigationActionPolicyCancel);
+    decisionHandler([action.request.URL isEqual:[self localPageForWebView:webView]] ? WKNavigationActionPolicyAllow : WKNavigationActionPolicyCancel);
 }
 - (void)userContentController:(WKUserContentController *)controller didReceiveScriptMessage:(WKScriptMessage *)message {
     (void)controller;
-    NSURL *allowedURL = message.webView == self.translationPanel.chatView ? self.translationURL : self.pageURL;
+    NSURL *allowedURL = [self localPageForWebView:message.webView];
     if (!message.frameInfo.isMainFrame || ![message.frameInfo.request.URL isEqual:allowedURL] ||
         ![message.body isKindOfClass:NSDictionary.class]) return;
     NSDictionary *body = message.body;
+    if ([body[@"type"] isEqual:@"replace-chat-box"] && [body[@"text"] isKindOfClass:NSString.class]) {
+        NSString *text = body[@"text"];
+        // 顶层是字符串，必须显式允许 JSON 片段，否则 dataWithJSONObject 会抛异常。
+        NSData *json = [NSJSONSerialization dataWithJSONObject:text options:NSJSONWritingFragmentsAllowed error:nil];
+        NSString *literal = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
+        [self.panel.chatView evaluateJavaScript:[NSString stringWithFormat:@"window.dispatchEvent(new CustomEvent('synor-translation-result',{detail:{text:%@}}))", literal] completionHandler:nil];
+        return;
+    }
     if ([body[@"type"] isEqual:@"open-translation"]) [self showTranslation:nil];
-    if (([body[@"type"] isEqual:@"chat"] || [body[@"type"] isEqual:@"translate"] || [body[@"type"] isEqual:@"cancel"] || [body[@"type"] isEqual:@"settings-load"] || [body[@"type"] isEqual:@"settings-save"]) && chatRequest) {
+    if ([body[@"type"] isEqual:@"open-settings"]) [self presentSettings];
+    if (([body[@"type"] isEqual:@"chat"] || [body[@"type"] isEqual:@"translate"] || [body[@"type"] isEqual:@"cancel"] || [body[@"type"] isEqual:@"settings-load"] || [body[@"type"] isEqual:@"settings-save"] || [body[@"type"] isEqual:@"models-load"]) && chatRequest) {
         if (![body[@"type"] isEqual:@"cancel"] && [body[@"id"] isKindOfClass:NSString.class]) {
             [requestViews setObject:message.webView forKey:body[@"id"]];
         }
@@ -536,7 +939,11 @@ const char *synor_settings(const char *json) {
     }
     if ([body[@"type"] isEqual:@"close"]) {
         if (message.webView == self.translationPanel.chatView) [self.translationPanel orderOut:nil];
-        else [self hideWindow:nil];
+        else if (message.webView == self.settingsPanel.chatView) {
+            [self.settingsPanel orderOut:nil];
+            // 关闭配置窗口后让聊天页重新读取配置，刷新底部模型名与思考开关。
+            [self.panel.chatView evaluateJavaScript:@"window.dispatchEvent(new Event('synor-settings-refresh'));" completionHandler:nil];
+        } else [self hideWindow:nil];
     }
     if ([body[@"type"] isEqual:@"paste"]) {
         NSPasteboard *pasteboard = NSPasteboard.generalPasteboard;
