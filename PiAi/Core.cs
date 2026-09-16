@@ -66,11 +66,11 @@ internal static class Sse
     }
 
     internal static string? String(JsonElement value, string name)
-        => value.TryGetProperty(name, out var property) && property.ValueKind == JsonValueKind.String
+        => value.ValueKind == JsonValueKind.Object && value.TryGetProperty(name, out var property) && property.ValueKind == JsonValueKind.String
             ? property.GetString() : null;
 
     internal static long Long(JsonElement value, string name)
-        => value.TryGetProperty(name, out var property) && property.TryGetInt64(out var result) ? result : 0;
+        => value.ValueKind == JsonValueKind.Object && value.TryGetProperty(name, out var property) && property.ValueKind == JsonValueKind.Number && property.TryGetInt64(out var result) ? result : 0;
 
     /// <summary>
     /// 缓存命中的输入 Token：兼容 OpenAI 的 prompt/input_tokens_details.cached_tokens 与 Anthropic 风格的 cache_read_input_tokens。
@@ -92,8 +92,9 @@ internal static class Sse
     {
         "stop" or "completed" => AiFinishReason.Stop,
         "tool_calls" or "function_call" => AiFinishReason.ToolCalls,
-        "length" or "max_tokens" => AiFinishReason.Length,
+        "length" or "max_tokens" or "max_output_tokens" => AiFinishReason.Length,
         "content_filter" => AiFinishReason.ContentFilter,
+        "error" or "failed" => AiFinishReason.Error,
         _ => AiFinishReason.Unknown
     };
 }

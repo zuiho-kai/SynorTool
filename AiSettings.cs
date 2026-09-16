@@ -1,12 +1,5 @@
 using System.Runtime.InteropServices;
 using System.Text.Json;
-using System.Text.Json.Serialization;
-
-internal enum ApiMode
-{
-    Responses,
-    ChatCompletions
-}
 
 /// <summary>
 /// 累计 token 用量；跨应用重启和清空对话持续累加，只由 <see cref="AiSettings.AddUsage"/> 更新。
@@ -23,16 +16,14 @@ internal sealed record UsageTotals
     public long CachedTokens { get; init; }
 }
 
+/// <summary>最近一次余额查询状态；查询失败时保留上次成功的金额。</summary>
+internal sealed record BalanceSnapshot(string Amount, string Currency, DateTimeOffset CheckedAt, string? Error);
+
 /// <summary>
 /// 当前 OpenAI 兼容服务的配置，整体保存在应用数据目录的 JSON 文件中。
 /// </summary>
 internal sealed record AiSettings
 {
-    /// <summary>
-    /// 协议模式；未写入该字段的旧配置默认为 Responses。
-    /// </summary>
-    [JsonConverter(typeof(JsonStringEnumConverter))]
-    public ApiMode ApiMode { get; init; } = ApiMode.Responses;
     /// <summary>
     /// 服务的 API 基础地址，包含版本路径。
     /// </summary>
@@ -45,6 +36,14 @@ internal sealed record AiSettings
     /// Bearer 密钥，本地无认证服务可留空。
     /// </summary>
     public string ApiKey { get; init; } = "";
+    /// <summary>余额查询完整地址；留空时不启用。</summary>
+    public string BalanceUrl { get; init; } = "";
+    /// <summary>余额 JSON 字段路径，支持对象与数组下标。</summary>
+    public string BalancePath { get; init; } = "balance_infos[0].total_balance";
+    /// <summary>币种 JSON 字段路径。</summary>
+    public string BalanceCurrencyPath { get; init; } = "balance_infos[0].currency";
+    /// <summary>仅由成功匹配已保存配置的余额查询更新。</summary>
+    public BalanceSnapshot? LastBalance { get; init; }
     /// <summary>
     /// 每轮请求最前面的系统指令。
     /// </summary>
@@ -80,10 +79,13 @@ internal sealed record AiSettings
     public UsageTotals Cumulative { get; init; } = new();
 
     /// <summary>
-    /// 配置目录：macOS 应用数据目录 ~/Library/Application Support/Synor。
+    /// 配置目录：macOS 应用数据目录 ~/Library/Application Support/Synor；
+    /// 设置 SYNOR_SETTINGS_DIR 时改用它，供自动化测试隔离，避免写到真实配置。
     /// </summary>
-    private static string SettingsDirectory { get; } = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Synor");
+    private static string SettingsDirectory { get; } =
+        Environment.GetEnvironmentVariable("SYNOR_SETTINGS_DIR") is { Length: > 0 } overrideDirectory
+            ? Path.GetFullPath(overrideDirectory)
+            : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Synor");
 
     /// <summary>
     /// 配置文件路径；整个配置（含 API Key）以一个 JSON 文件保存。
@@ -108,6 +110,13 @@ internal sealed record AiSettings
         }
         settings = settings with { Model = settings.Model?.Trim() ?? "", ApiKey = settings.ApiKey?.Trim() ?? "", SystemPrompt = settings.SystemPrompt ?? "", UserAgent = string.IsNullOrWhiteSpace(settings.UserAgent) ? DefaultUserAgent : settings.UserAgent.Trim() };
         settings = settings with { BaseUrl = NormalizeBaseUrl(settings.BaseUrl) };
+        settings = settings with { BalanceUrl = settings.BalanceUrl?.Trim() ?? "", BalancePath = settings.BalancePath?.Trim() ?? "", BalanceCurrencyPath = settings.BalanceCurrencyPath?.Trim() ?? "" };
+        if (settings.BalanceUrl.Length > 0)
+        {
+            NormalizeBaseUrl(settings.BalanceUrl);
+            if (settings.BalancePath.Length == 0 || settings.BalanceCurrencyPath.Length == 0)
+                throw new ArgumentException("请填写余额与币种字段路径。");
+        }
         var directory = AgentTools.ResolvePath(settings.WorkingDirectory, Environment.GetFolderPath(Environment.SpecialFolder.UserProfile));
         if (!Directory.Exists(directory)) throw new ArgumentException("工作目录不存在。");
         settings = settings with { WorkingDirectory = directory };
@@ -124,10 +133,34 @@ internal sealed record AiSettings
         lock (SettingsLock)
         {
             // 累计用量只由 AddUsage 维护；保存配置时保留磁盘上的最新值，避免配置窗口的旧快照把它清零。
-            settings = settings with { Cumulative = LoadCore().Cumulative };
+            var current = LoadCore();
+            settings = settings with { Cumulative = current.Cumulative, LastBalance = settings.SameBalanceConfiguration(current) ? current.LastBalance : null };
             SaveCore(settings);
         }
         return settings;
+    }
+
+    /// <summary>确保查询结果仍属于当前服务与密钥，避免配置切换后显示旧余额。</summary>
+    internal bool SameBalanceConfiguration(AiSettings other) =>
+        BaseUrl.Trim().TrimEnd('/') == other.BaseUrl.Trim().TrimEnd('/') && ApiKey.Trim() == other.ApiKey.Trim() &&
+        BalanceUrl.Trim().TrimEnd('/') == other.BalanceUrl.Trim().TrimEnd('/') &&
+        BalancePath.Trim() == other.BalancePath.Trim() && BalanceCurrencyPath.Trim() == other.BalanceCurrencyPath.Trim();
+
+    /// <summary>保存查询状态；不启用未保存配置，也不允许较早的请求覆盖较新结果。</summary>
+    internal static bool UpdateBalance(AiSettings queried, DateTimeOffset started, string? amount, string? currency, string? error)
+    {
+        lock (SettingsLock)
+        {
+            var current = LoadCore();
+            if (!queried.SameBalanceConfiguration(current) || string.IsNullOrWhiteSpace(current.BalanceUrl) ||
+                (current.LastBalance is { } previous && previous.CheckedAt > started)) return false;
+            var snapshot = amount is not null && currency is not null
+                ? new BalanceSnapshot(amount, currency, started, null)
+                : current.LastBalance is { } last ? last with { CheckedAt = started, Error = error } : null;
+            if (snapshot is null) return false;
+            SaveCore(current with { LastBalance = snapshot });
+            return true;
+        }
     }
 
     /// <summary>
@@ -209,5 +242,37 @@ internal sealed record AiSettings
             throw new ArgumentException("请填写 API 基础地址，例如 https://example.com/v1，不包含 /chat/completions。");
         }
         return normalized;
+    }
+
+    /// <summary>按点分隔的属性名与 [下标] 读取余额响应；拒绝缺失或非标量字段。</summary>
+    internal static string ReadBalanceField(JsonElement value, string path)
+    {
+        path = path.Trim();
+        if (!System.Text.RegularExpressions.Regex.IsMatch(path, @"\A[^.\[\]\s]+(?:\[[0-9]+\])*(?:\.[^.\[\]\s]+(?:\[[0-9]+\])*)*\z"))
+            throw new ArgumentException("字段路径格式无效，请使用 data.balance 或 balance_infos[0].total_balance。");
+        foreach (var part in path.Split('.'))
+        {
+            var bracket = part.IndexOf('[');
+            var property = bracket < 0 ? part : part[..bracket];
+            if (value.ValueKind != JsonValueKind.Object || !value.TryGetProperty(property, out value))
+                throw new JsonException($"响应缺少字段：{path}");
+            while (bracket >= 0)
+            {
+                var end = part.IndexOf(']', bracket);
+                if (!int.TryParse(part.AsSpan(bracket + 1, end - bracket - 1), out var index) ||
+                    value.ValueKind != JsonValueKind.Array || index >= value.GetArrayLength())
+                    throw new JsonException($"响应数组下标无效：{path}");
+                value = value[index];
+                bracket = part.IndexOf('[', end + 1);
+            }
+        }
+        var text = value.ValueKind switch
+        {
+            JsonValueKind.String => value.GetString(),
+            JsonValueKind.Number => value.GetRawText(),
+            _ => null
+        };
+        if (string.IsNullOrWhiteSpace(text)) throw new JsonException($"响应字段必须是非空字符串或数字：{path}");
+        return text;
     }
 }

@@ -30,7 +30,11 @@ public sealed class OpenAiResponsesProvider : IAiProvider
             ["store"] = false
         };
         if (request.Tools is { Count: > 0 }) body["tools"] = OpenAiResponsesWire.Tools(request.Tools);
-        if (!string.IsNullOrWhiteSpace(request.ReasoningEffort)) body["reasoning"] = new { effort = request.ReasoningEffort };
+        if (!string.IsNullOrWhiteSpace(request.ReasoningEffort))
+        {
+            body["reasoning"] = new { effort = request.ReasoningEffort };
+            body["include"] = new[] { "reasoning.encrypted_content" };
+        }
 
         using var message = new HttpRequestMessage(HttpMethod.Post, _endpoint) { Content = JsonContent.Create(body) };
         if (_apiKey is not null) message.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _apiKey);
@@ -52,11 +56,8 @@ public sealed class OpenAiResponsesProvider : IAiProvider
         var completed = false;
         await foreach (var frame in Sse.ReadAsync(reader, cancellationToken).ConfigureAwait(false))
         {
-            if (frame.Data == "[DONE]") { completed = true; break; }
-            JsonDocument? document = null;
-            try { document = JsonDocument.Parse(frame.Data); }
-            catch (JsonException) { continue; }
-            using (document)
+            if (frame.Data == "[DONE]") break;
+            using (var document = JsonDocument.Parse(frame.Data))
             {
                 var root = document.RootElement;
                 var kind = Sse.String(root, "type") ?? frame.Event;
@@ -84,7 +85,7 @@ public sealed class OpenAiResponsesProvider : IAiProvider
                     canonicalCallIds[index] = callId;
                     if (!string.IsNullOrEmpty(itemId)) callIndexes[itemId] = index;
                     var name = Sse.String(item, "name");
-                    var nameDelta = callNamesSeen.Add(index) ? name : null;
+                    var nameDelta = !string.IsNullOrEmpty(name) && callNamesSeen.Add(index) ? name : null;
                     var completeArguments = kind == "response.output_item.done" && argumentDeltasSeen.Add(index) ? Sse.String(item, "arguments") : null;
                     yield return new AiToolCallDelta(index, callId, nameDelta, completeArguments);
                 }
@@ -106,7 +107,7 @@ public sealed class OpenAiResponsesProvider : IAiProvider
                         if (!string.IsNullOrEmpty(arguments)) yield return new AiToolCallDelta(index, canonicalId, null, arguments);
                     }
                 }
-                else if (kind == "response.completed")
+                else if (kind is "response.completed" or "response.incomplete")
                 {
                     completed = true;
                     if (root.TryGetProperty("response", out var completedResponse)) root = completedResponse;
@@ -123,7 +124,10 @@ public sealed class OpenAiResponsesProvider : IAiProvider
                         var outputTokens = Sse.Long(usage, "output_tokens");
                         yield return new AiUsage(input, outputTokens, Sse.Long(usage, "total_tokens") == 0 ? input + outputTokens : Sse.Long(usage, "total_tokens"), Sse.Cached(usage));
                     }
-                    yield return new AiCompleted(AiFinishReason.Stop);
+                    var finish = kind == "response.completed" ? AiFinishReason.Stop
+                        : root.TryGetProperty("incomplete_details", out var details) ? Sse.Finish(Sse.String(details, "reason")) : AiFinishReason.Unknown;
+                    if (finish == AiFinishReason.Unknown) yield return new AiError("Responses 返回无法识别的未完成状态。");
+                    else yield return new AiCompleted(finish);
                 }
                 else if (root.TryGetProperty("usage", out var genericUsage) && genericUsage.ValueKind == JsonValueKind.Object)
                 {
@@ -133,7 +137,7 @@ public sealed class OpenAiResponsesProvider : IAiProvider
                 }
             }
         }
-        if (!completed) yield return new AiCompleted();
+        if (!completed) yield return new AiError("连接提前结束，未收到有效的完成状态。");
     }
 
     private static int GetCallIndex(Dictionary<string, int> indexes, string id, ref int next)
@@ -142,111 +146,6 @@ public sealed class OpenAiResponsesProvider : IAiProvider
         value = next++;
         indexes[id] = value;
         return value;
-    }
-}
-
-/// <summary>OpenAI Chat Completions adapter for LM Studio and CLIProxyAPI.</summary>
-public sealed class OpenAiChatCompletionsProvider : IAiProvider
-{
-    private readonly HttpClient _client;
-    private readonly Uri _endpoint;
-    private readonly string? _apiKey;
-    private readonly string? _userAgent;
-
-    public OpenAiChatCompletionsProvider(HttpClient client, string baseUrl, string? apiKey = null, string? userAgent = null)
-    {
-        _client = client ?? throw new ArgumentNullException(nameof(client));
-        _endpoint = OpenAiUri.Endpoint(baseUrl, "chat/completions");
-        _apiKey = string.IsNullOrWhiteSpace(apiKey) ? null : apiKey;
-        _userAgent = string.IsNullOrWhiteSpace(userAgent) ? null : userAgent;
-    }
-
-    public async IAsyncEnumerable<AiEvent> StreamAsync(AiRequest request, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
-    {
-        var body = new Dictionary<string, object?>
-        {
-            ["model"] = request.Model,
-            ["messages"] = OpenAiChatCompletionsWire.Messages(request.Input),
-            ["stream"] = request.Stream,
-            ["stream_options"] = new { include_usage = true }
-        };
-        if (request.Tools is { Count: > 0 }) { body["tools"] = request.Tools; body["tool_choice"] = "auto"; }
-        if (!string.IsNullOrWhiteSpace(request.ReasoningEffort)) body["reasoning_effort"] = request.ReasoningEffort;
-
-        using var message = new HttpRequestMessage(HttpMethod.Post, _endpoint) { Content = JsonContent.Create(body) };
-        if (_apiKey is not null) message.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _apiKey);
-        if (_userAgent is not null) message.Headers.TryAddWithoutValidation("User-Agent", _userAgent);
-        using var response = await _client.SendAsync(message, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
-        if (!response.IsSuccessStatusCode)
-        {
-            yield return new AiError(await OpenAiUri.ErrorAsync(response, cancellationToken).ConfigureAwait(false));
-            yield break;
-        }
-        using var reader = new StreamReader(await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false));
-        var completed = false;
-        await foreach (var frame in Sse.ReadAsync(reader, cancellationToken).ConfigureAwait(false))
-        {
-            if (frame.Data == "[DONE]") { completed = true; break; }
-            JsonDocument? document = null;
-            try { document = JsonDocument.Parse(frame.Data); }
-            catch (JsonException) { continue; }
-            using (document)
-            {
-                var root = document.RootElement;
-                if (root.TryGetProperty("error", out var error)) { yield return new AiError(error.ToString()); continue; }
-                if (root.TryGetProperty("usage", out var usage) && usage.ValueKind == JsonValueKind.Object)
-                    yield return new AiUsage(Sse.Long(usage, "prompt_tokens"), Sse.Long(usage, "completion_tokens"), Sse.Long(usage, "total_tokens"), Sse.Cached(usage));
-                if (!root.TryGetProperty("choices", out var choices) || choices.GetArrayLength() == 0) continue;
-                var choice = choices[0];
-                var finish = choice.TryGetProperty("finish_reason", out var finishProperty) ? Sse.Finish(Sse.String(choice, "finish_reason")) : AiFinishReason.Unknown;
-                if (choice.TryGetProperty("delta", out var delta))
-                {
-                    var text = Sse.String(delta, "content");
-                    if (!string.IsNullOrEmpty(text)) yield return new AiTextDelta(text);
-                    var reasoning = Sse.String(delta, "reasoning_content") ?? Sse.String(delta, "reasoning");
-                    if (!string.IsNullOrEmpty(reasoning)) yield return new AiReasoningDelta(reasoning);
-                    if (delta.TryGetProperty("tool_calls", out var toolCalls) && toolCalls.ValueKind == JsonValueKind.Array)
-                        foreach (var call in toolCalls.EnumerateArray())
-                        {
-                            var index = call.TryGetProperty("index", out var indexValue) ? indexValue.GetInt32() : 0;
-                            var id = Sse.String(call, "id");
-                            var function = call.TryGetProperty("function", out var functionValue) ? functionValue : default;
-                            yield return new AiToolCallDelta(index, id, Sse.String(function, "name"), Sse.String(function, "arguments"));
-                        }
-                }
-                if (finish != AiFinishReason.Unknown) { completed = true; yield return new AiCompleted(finish); }
-            }
-        }
-        if (!completed) yield return new AiCompleted();
-    }
-}
-
-internal static class OpenAiChatCompletionsWire
-{
-    /// <summary>Chat Completions 不认识 Responses 专用的 reasoning_items，发送前移除。</summary>
-    /// <param name="input">消息数组。</param>
-    /// <returns>可直接写入请求体的消息列表。</returns>
-    internal static List<object> Messages(JsonElement input)
-    {
-        var result = new List<object>();
-        foreach (var message in input.EnumerateArray())
-        {
-            if (message.ValueKind == JsonValueKind.Object && message.TryGetProperty("reasoning_items", out _))
-            {
-                var copy = new Dictionary<string, object?>();
-                foreach (var property in message.EnumerateObject())
-                {
-                    if (property.NameEquals("reasoning_items")) continue;
-                    copy[property.Name] = property.Value.Clone();
-                }
-                result.Add(copy);
-            }
-            else
-            {
-                result.Add(message.Clone());
-            }
-        }
-        return result;
     }
 }
 

@@ -5,11 +5,11 @@ This document records the completed integration of the pi-ai inspired provider c
 ## Current implementation
 
 - `PiAi/Core.cs` defines normalized request and streaming event contracts.
-- `PiAi/OpenAiAdapters.cs` parses OpenAI Responses and Chat Completions SSE streams.
-- `ChatClient.cs` selects the configured API mode and feeds text, reasoning, tool-call, usage, cancellation, and error events into the existing multi-round tool loop.
-- `AiSettings.cs` and the Web settings page expose API mode and reasoning controls.
+- `PiAi/OpenAiAdapters.cs` parses OpenAI Responses SSE streams.
+- `ChatClient.cs` uses the Responses provider and feeds text, reasoning, tool-call, usage, cancellation, and error events into the existing multi-round tool loop.
+- `AiSettings.cs` and the Web settings page expose connection settings and reasoning controls.
 
-The configured base URL is OpenAI-compatible and excludes the endpoint path. Responses uses `/responses`; Chat Completions uses `/chat/completions`.
+The configured base URL is OpenAI-compatible and excludes the endpoint path. Chat and translation both use `/responses`.
 
 ## Verification
 

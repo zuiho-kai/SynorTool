@@ -27,7 +27,7 @@ const adapter: ChatModelAdapter = {
     const bridge = window.webkit?.messageHandlers.synor;
     if (!bridge) throw new Error('请在 Synor 原生窗口中使用聊天。');
     const id = crypto.randomUUID();
-    const queue: {tool?:Partial<ToolState> & {callId:string};apiMessages?:unknown[];generationMs?:number;elapsedMs?:number;firstTokenMs?:number;usage?:TokenUsage;cumulative?:UsageTotals;reasoning?:string;text?:string;done?:boolean;error?:string}[] = [];
+    const queue: {tool?:Partial<ToolState> & {callId:string};apiMessages?:unknown[];generationMs?:number;elapsedMs?:number;firstTokenMs?:number;usage?:TokenUsage;cumulative?:UsageTotals;reasoning?:string;text?:string;done?:boolean;stopReason?:string;error?:string}[] = [];
     let wake = ()=>{};
     let completed = false;
     const receive = (event:Event)=>{
@@ -42,6 +42,7 @@ const adapter: ChatModelAdapter = {
       bridge.postMessage({type:'chat',id,thinking:runConfig.custom?.thinking !== false,effort:(runConfig.custom?.effort as string | undefined) ?? 'high',messages:messages.flatMap(message=>{
         const stored=message.metadata?.custom?.apiMessages;
         if(message.role==='assistant' && Array.isArray(stored))return stored;
+        if(message.role==='assistant' && message.status.type==='incomplete')return [];
         return [{role:message.role,
           content:[...message.content,...(message.role==='user' ? message.attachments?.flatMap(a=>a.content) ?? [] : [])]
             .flatMap<{type:'text';text:string} | {type:'image_url';image_url:{url:string}}>(part=>part.type==='text' ? [{type:'text',text:part.text}] : part.type==='image' ? [{type:'image_url',image_url:{url:part.image}}] : [])}];
@@ -75,7 +76,7 @@ const adapter: ChatModelAdapter = {
             cumulative = event.cumulative ?? cumulative;
             reasoning+=event.reasoning ?? '';
             text+=event.text ?? '';
-            yield {metadata:{custom:{firstTokenMs,usage,cumulative,elapsedMs,generationMs,apiMessages,tools:tools.map(tool=>({...tool}))}},content:[
+            yield {metadata:{custom:{firstTokenMs,usage,cumulative,elapsedMs,generationMs,apiMessages,stopReason:event.stopReason,tools:tools.map(tool=>({...tool}))}},content:[
               ...(reasoning ? [{type:'reasoning' as const,text:reasoning}] : []),
               ...(text ? [{type:'text' as const,text}] : [])
             ]};
@@ -140,6 +141,7 @@ function AssistantMessage() {
     return typeof value === 'string' ? value : value && typeof value === 'object' && 'message' in value ? String(value.message) : '请求失败，请重试。';
   });
   const firstTokenMs = useAuiState(s=>s.message.metadata.custom.firstTokenMs) as number | undefined;
+  const truncated = useAuiState(s=>s.message.metadata.custom.stopReason === 'Length');
   const usage = useAuiState(s=>s.message.metadata.custom.usage) as TokenUsage | undefined;
   const elapsedMs = useAuiState(s=>s.message.metadata.custom.elapsedMs) as number | undefined;
   const measuredGenerationMs = useAuiState(s=>s.message.metadata.custom.generationMs) as number | undefined;
@@ -147,7 +149,7 @@ function AssistantMessage() {
   const generationMs = measuredGenerationMs ?? (elapsedMs !== undefined && firstTokenMs !== undefined ? elapsedMs-firstTokenMs : 0);
   const speed = usage && generationMs>0 ? usage.completion_tokens/(generationMs/1000) : undefined;
   const [copied,setCopied] = useState(false);
-  return <MessagePrimitive.Root className="assistant message"><div className="byline"><span className="spark">✦</span> SYNOR <span className="badge">AI</span></div>{tools?.map(tool=><details className="tool-call" key={tool.callId} open={tool.status==='running' && running ? true : undefined}><summary><span className="tool-name">{tool.name}</span><span>{tool.status==='running' ? running ? '执行中…' : '已中断' : tool.status==='error' ? '执行失败' : '已完成'}</span></summary><pre className="tool-arguments">{tool.arguments}</pre>{tool.output && <pre className="tool-output">{tool.output}</pre>}{tool.image && <img className="tool-image" src={tool.image} alt="工具读取的图片"/>}</details>)}<div className="markdown"><MessagePrimitive.Parts components={{Text:Markdown,Reasoning}}/></div>{running && !text && !hasReasoning && !tools?.length && <p>正在生成…</p>}{error && <p role="alert">{error}</p>}<div className="answer-actions"><button className="copy" onClick={()=>{ window.webkit?.messageHandlers.synor.postMessage({type:'copy',text}); setCopied(true); }}>{copied?'已复制 ✓':'复制回答'}</button><span className="answer-stats">
+  return <MessagePrimitive.Root className="assistant message"><div className="byline"><span className="spark">✦</span> SYNOR <span className="badge">AI</span></div>{tools?.map(tool=><details className="tool-call" key={tool.callId} open={tool.status==='running' && running ? true : undefined}><summary><span className="tool-name">{tool.name}</span><span>{tool.status==='running' ? running ? '执行中…' : '已中断' : tool.status==='error' ? '执行失败' : '已完成'}</span></summary><pre className="tool-arguments">{tool.arguments}</pre>{tool.output && <pre className="tool-output">{tool.output}</pre>}{tool.image && <img className="tool-image" src={tool.image} alt="工具读取的图片"/>}</details>)}<div className="markdown"><MessagePrimitive.Parts components={{Text:Markdown,Reasoning}}/></div>{running && !text && !hasReasoning && !tools?.length && <p>正在生成…</p>}{error && <p role="alert">{error}</p>}{truncated && <p role="status">回答已达到输出上限，内容可能不完整。</p>}<div className="answer-actions"><button className="copy" onClick={()=>{ window.webkit?.messageHandlers.synor.postMessage({type:'copy',text}); setCopied(true); }}>{copied?'已复制 ✓':'复制回答'}</button><span className="answer-stats">
     <span title="从发起请求到收到首个思考或正文片段的本地耗时">首 Token {firstTokenMs === undefined ? '—' : `${(firstTokenMs/1000).toFixed(2)} s`}</span>
     <span title="服务端输出 Token 数 ÷ 各轮首个输出到流结束的耗时之和，排除工具执行时间；包括服务端计入的思考与工具调用 Token">速度 {speed === undefined ? (running ? '统计中…' : '—') : `${speed.toFixed(1)} Token/s`}</span>
     <span title={usage ? `本次输出 ${usage.completion_tokens} Token` : undefined}>{usage ? `↓${formatTokens(usage.completion_tokens)} Token` : running ? 'Token 统计中…' : 'Token 未返回'}</span>
@@ -170,7 +172,7 @@ function ImageAttachment() {
 function UserMessage() { return <MessagePrimitive.Root className="user message"><div className="attachments"><MessagePrimitive.Attachments components={{Attachment:ImageAttachment}}/></div><MessagePrimitive.Parts /></MessagePrimitive.Root>; }
 function Chat() {
   const aui = useAui();
-  const [config,setConfig] = useState<{Model:string;ReasoningControl:boolean;Cumulative?:UsageTotals}>();
+  const [config,setConfig] = useState<{Model:string;ReasoningControl:boolean;Cumulative?:UsageTotals;LastBalance?:{Amount:string;Currency:string;CheckedAt:string;Error?:string}}>();
   const [cumulative,setCumulative] = useState<UsageTotals>();
   const thinking = useAuiState(s=>s.composer.runConfig.custom?.thinking !== false);
   const effort = (useAuiState(s=>s.composer.runConfig.custom?.effort) as string | undefined) ?? 'high';
@@ -286,7 +288,7 @@ function Chat() {
         event.currentTarget.closest('form')?.requestSubmit();
       }
     }} addAttachmentOnPaste className="input" placeholder={running?'追加下一条消息…':'输入消息，或粘贴图片…'} rows={2} submitMode="none"/><div className="composer-options"><button type="button" className="thinking-option" role="switch" aria-checked={thinking} disabled={running || !config?.ReasoningControl} title={!config?.ReasoningControl ? '思考行为由服务端决定' : undefined} onClick={()=>aui.composer.setRunConfig({custom:{thinking:!thinking,effort}})}><span className="thinking-indicator" aria-hidden="true"/>思考模式<span>{!config?.ReasoningControl ? '服务端决定' : thinking ? '已开启' : '已关闭'}</span></button><span className="effort-option" role="group" aria-label="思考强度">{(['low','high','max'] as const).map(level=><button key={level} type="button" aria-pressed={effort===level} disabled={running || !config?.ReasoningControl} title={!config?.ReasoningControl ? '思考行为由服务端决定' : `思考强度：${level}`} onClick={()=>aui.composer.setRunConfig({custom:{thinking,effort:level}})}>{level}</button>)}</span><button type="button" className="translation-entry" title="清空当前聊天上下文（⌘L）" aria-keyshortcuts="Meta+L" onClick={()=>window.dispatchEvent(new Event('synor-clear-context'))}><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="m15 9 5-6M13 7l4 4-7 10H3v-7Z"/><path d="m6 14 5 5M3 21h17"/></svg>清理</button><button type="button" className="translation-entry" onClick={()=>window.webkit?.messageHandlers.synor.postMessage({type:'open-translation'})}><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M3 5h12M9 3v2M12 5c-1 6-4 9-9 11M5 8c1 3 4 6 7 8m1 5 4-11 4 11m-6.5-4h5"/></svg>翻译</button><SettingsEntry/></div><div className="compose-actions"><ComposerPrimitive.Send className="send" aria-label={running ? "追加消息" : "发送消息"}>↑</ComposerPrimitive.Send><ThreadPrimitive.If running><ComposerPrimitive.Cancel className="send stop" aria-label="停止生成" hidden>■</ComposerPrimitive.Cancel></ThreadPrimitive.If></div></ComposerPrimitive.Root>
-    <footer><span className="footer-info"><span className="keyboard-hint">Enter 发送 · Shift + Enter 换行 · Esc 停止生成</span>{contextUsage && <span title={`当前上下文输入 ${contextUsage.prompt_tokens} Token`}>上下文 ↑{formatTokens(contextUsage.prompt_tokens)}</span>}{cumulative && cumulative.TotalTokens > 0 && <span title={`累计输入 ${cumulative.InputTokens} · 输出 ${cumulative.OutputTokens} · 合计 ${cumulative.TotalTokens} Token`}>累计 ↑{formatTokens(cumulative.InputTokens)} ↓{formatTokens(cumulative.OutputTokens)} | {formatTokens(cumulative.TotalTokens)}</span>}{cumulative && cumulative.CachedTokens > 0 && cumulative.InputTokens > 0 && <span title={`累计命中缓存 ${cumulative.CachedTokens} / 输入 ${cumulative.InputTokens} Token`}>缓存率 {formatPercent(Math.min(cumulative.CachedTokens / cumulative.InputTokens, 1))}</span>}</span><span className="demo-status" role={pasteError ? "alert" : undefined}>{pasteError || <><span className="dot"/>{config?.Model ?? '读取配置中…'}</>}</span></footer>
+    <footer><span className="footer-info">{config?.LastBalance && <span role="status" title={config.LastBalance.Error || `查询时间：${new Date(config.LastBalance.CheckedAt).toLocaleString()}`}>余额：{config.LastBalance.Amount} {config.LastBalance.Currency}{config.LastBalance.Error ? ' · 更新失败' : ''}</span>}<span className="keyboard-hint">Enter 发送 · Shift + Enter 换行 · Esc 停止生成</span>{contextUsage && <span title={`当前上下文输入 ${contextUsage.prompt_tokens} Token`}>上下文 ↑{formatTokens(contextUsage.prompt_tokens)}</span>}{cumulative && cumulative.TotalTokens > 0 && <span title={`累计输入 ${cumulative.InputTokens} · 输出 ${cumulative.OutputTokens} · 合计 ${cumulative.TotalTokens} Token`}>累计 ↑{formatTokens(cumulative.InputTokens)} ↓{formatTokens(cumulative.OutputTokens)} | {formatTokens(cumulative.TotalTokens)}</span>}{cumulative && cumulative.CachedTokens > 0 && cumulative.InputTokens > 0 && <span title={`累计命中缓存 ${cumulative.CachedTokens} / 输入 ${cumulative.InputTokens} Token`}>缓存率 {formatPercent(Math.min(cumulative.CachedTokens / cumulative.InputTokens, 1))}</span>}</span><span className="demo-status" role={pasteError ? "alert" : undefined}>{pasteError || <><span className="dot"/>{config?.Model ?? '读取配置中…'}</>}</span></footer>
   </ThreadPrimitive.Root>;
 }
 function App() {

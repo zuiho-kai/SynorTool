@@ -1,6 +1,7 @@
 #import <AppKit/AppKit.h>
 #import <WebKit/WebKit.h>
 #import <ApplicationServices/ApplicationServices.h>
+#import "SynorMarkdown.h"
 
 static void (*chatRequest)(const char *);
 static NSMapTable<NSString *, WKWebView *> *requestViews;
@@ -15,6 +16,7 @@ void synor_chat_event(const char *json) {
         NSDictionary *event = [NSJSONSerialization JSONObjectWithData:[payload dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
         NSString *requestID = event[@"id"];
         if (!requestID) return;
+        if ([event[@"balanceChanged"] boolValue]) [[NSNotificationCenter defaultCenter] postNotificationName:@"SynorBalanceChanged" object:nil];
         if (backgroundTranslationID && [requestID isEqual:backgroundTranslationID]) {
             if ([event[@"text"] isKindOfClass:NSString.class]) {
                 if (!backgroundTranslationText) backgroundTranslationText = [NSMutableString new];
@@ -30,7 +32,7 @@ void synor_chat_event(const char *json) {
             return;
         }
         WKWebView *view = [requestViews objectForKey:requestID];
-        if (event[@"done"] || event[@"error"] || event[@"settings"] || event[@"models"]) [requestViews removeObjectForKey:requestID];
+        if (event[@"done"] || event[@"error"] || event[@"settings"] || event[@"models"] || event[@"balance"]) [requestViews removeObjectForKey:requestID];
         [view callAsyncJavaScript:@"window.dispatchEvent(new CustomEvent('synor-chat', {detail: JSON.parse(payload)}));"
             arguments:@{@"payload":payload} inFrame:nil inContentWorld:WKContentWorld.pageWorld completionHandler:nil];
     });
@@ -323,6 +325,10 @@ static BOOL SynorElementIsEditable(AXUIElementRef element) {
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     (void)notification;
     __weak PanelController *backgroundWeakSelf = self;
+    [[NSNotificationCenter defaultCenter] addObserverForName:@"SynorBalanceChanged" object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
+        (void)note;
+        [backgroundWeakSelf.panel.chatView evaluateJavaScript:@"window.dispatchEvent(new Event('synor-settings-refresh'));" completionHandler:nil];
+    }];
     [[NSNotificationCenter defaultCenter] addObserverForName:@"SynorBackgroundTranslationDone" object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
         PanelController *owner = backgroundWeakSelf; NSString *translated = note.object;
         if (!owner || !owner.backgroundElement || !translated.length) return;
@@ -509,8 +515,20 @@ static BOOL SynorElementIsEditable(AXUIElementRef element) {
         if (AXUIElementCopyAttributeValue(axApp, kAXFocusedUIElementAttribute, (CFTypeRef *)&focused) == kAXErrorSuccess && [self beginBackgroundTranslationIfPossible:selection element:focused application:app]) { CFRelease(focused); CFRelease(axApp); return; }
         if (focused) CFRelease(focused); CFRelease(axApp);
     }
-    if (selection.length) [self presentTranslationText:selection];
-    else [self copySelectionOrShowChat];
+    if (!selection.length) { [self copySelectionOrShowChat]; return; }
+    // Codex 的 Markdown 只存在于应用自己的复制格式里（AXSelectedText 会丢掉链接和行内代码），
+    // 静态选区时再模拟一次 ⌘C 取 HTML 转 Markdown，失败则回退辅助功能读到的文本。
+    if ([app.bundleIdentifier isEqual:@"com.openai.codex"] && !self.selectionTimer) {
+        __weak PanelController *weakSelf = self;
+        [self captureSelectionFrom:app completion:^(NSString *plain, NSString *html) {
+            PanelController *owner = weakSelf;
+            if (!owner) return;
+            NSString *markdown = SynorMarkdownFromHTML(html);
+            [owner presentTranslationText:(markdown.length ? markdown : (plain.length ? plain : selection))];
+        }];
+        return;
+    }
+    [self presentTranslationText:selection];
 }
 - (void)refreshGlobalShortcut {
     if (!AXIsProcessTrusted()) {
@@ -612,6 +630,82 @@ static BOOL SynorElementIsEditable(AXUIElementRef element) {
     if (data) chatRequest([[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding].UTF8String);
     return YES;
 }
+// 模拟一次 ⌘C 读取前台应用选区，读完还原剪贴板；plain 与 html 都可能为空。
+- (void)captureSelectionFrom:(NSRunningApplication *)source completion:(void (^)(NSString *plain, NSString *html))completion {
+    if (self.selectionTimer) return;
+    __weak PanelController *weakSelf = self;
+    NSDate *started = NSDate.date;
+    __block NSDate *copiedAt = nil;
+    __block NSInteger originalChange = 0;
+    __block NSArray<NSPasteboardItem *> *savedItems = nil;
+    self.selectionTimer = [NSTimer timerWithTimeInterval:0.05 repeats:YES block:^(NSTimer *timer) {
+        PanelController *owner = weakSelf;
+        if (!owner) { [timer invalidate]; completion(@"", nil); return; }
+        // 触发后立即读取；切换应用则取消，避免复制错误窗口。
+        if (NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier != source.processIdentifier || -started.timeIntervalSinceNow > 5) {
+            [timer invalidate]; owner.selectionTimer = nil; completion(@"", nil);
+            return;
+        }
+        NSPasteboard *pasteboard = NSPasteboard.generalPasteboard;
+        if (!copiedAt) {
+            NSEventModifierFlags otherModifiers = NSEvent.modifierFlags & (NSEventModifierFlagCommand | NSEventModifierFlagControl | NSEventModifierFlagShift | NSEventModifierFlagFunction);
+            if (otherModifiers) {
+                [timer invalidate]; owner.selectionTimer = nil; completion(@"", nil);
+                return;
+            }
+            // 复制所有已发布的剪贴板格式，图片和富文本也一并保留。
+            originalChange = pasteboard.changeCount;
+            NSMutableArray *snapshot = [NSMutableArray array];
+            for (NSPasteboardItem *item in pasteboard.pasteboardItems) {
+                NSPasteboardItem *saved = [NSPasteboardItem new];
+                for (NSPasteboardType type in item.types) {
+                    NSData *data = [item dataForType:type];
+                    if (data) [saved setData:data forType:type];
+                }
+                if (saved.types.count) [snapshot addObject:saved];
+            }
+            savedItems = snapshot;
+            if (pasteboard.changeCount != originalChange || NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier != source.processIdentifier) {
+                [timer invalidate]; owner.selectionTimer = nil; completion(@"", nil);
+                return;
+            }
+            // 使用独立按键状态并明确只设置 Command，不继承用户仍按住的 Option。
+            CGEventSourceRef copySource = CGEventSourceCreate(kCGEventSourceStatePrivate);
+            CGEventRef down = copySource ? CGEventCreateKeyboardEvent(copySource, 8, true) : NULL;
+            CGEventRef up = copySource ? CGEventCreateKeyboardEvent(copySource, 8, false) : NULL;
+            if (copySource) CFRelease(copySource);
+            if (!down || !up) {
+                if (down) CFRelease(down);
+                if (up) CFRelease(up);
+                [timer invalidate]; owner.selectionTimer = nil; completion(@"", nil);
+                return;
+            }
+            CGEventSetFlags(down, kCGEventFlagMaskCommand);
+            CGEventSetFlags(up, kCGEventFlagMaskCommand);
+            CGEventPostToPid(source.processIdentifier, down);
+            CGEventPostToPid(source.processIdentifier, up);
+            CFRelease(down); CFRelease(up);
+            copiedAt = NSDate.date;
+            return;
+        }
+        if (pasteboard.changeCount == originalChange && -copiedAt.timeIntervalSinceNow < 0.8) return;
+        NSString *plain = @"", *html = nil;
+        if (pasteboard.changeCount != originalChange) {
+            NSInteger copiedChange = pasteboard.changeCount;
+            plain = [[pasteboard stringForType:NSPasteboardTypeString] copy] ?: @"";
+            // 富文本一并取下来，HTML 可用来还原 Markdown 结构。
+            html = [[pasteboard stringForType:NSPasteboardTypeHTML] copy];
+            // 只恢复仍然是本次读取版本的剪贴板，避免覆盖随后发生的更新。
+            if (pasteboard.changeCount == copiedChange) {
+                [pasteboard clearContents];
+                if (savedItems.count) [pasteboard writeObjects:savedItems];
+            }
+        }
+        [timer invalidate]; owner.selectionTimer = nil;
+        completion(plain, html);
+    }];
+    [NSRunLoop.mainRunLoop addTimer:self.selectionTimer forMode:NSRunLoopCommonModes];
+}
 // 浏览器、微信等未提供 AX 选区时，通过应用自己的复制能力获取文本。
 - (void)copySelectionOrShowChat {
     if (self.selectionTimer) return;
@@ -628,78 +722,14 @@ static BOOL SynorElementIsEditable(AXUIElementRef element) {
         return;
     }
     __weak PanelController *weakSelf = self;
-    NSDate *started = NSDate.date;
-    __block NSDate *copiedAt = nil;
-    __block NSInteger originalChange = 0;
-    __block NSArray<NSPasteboardItem *> *savedItems = nil;
-    self.selectionTimer = [NSTimer timerWithTimeInterval:0.05 repeats:YES block:^(NSTimer *timer) {
+    [self captureSelectionFrom:source completion:^(NSString *plain, NSString *html) {
+        (void)html;
         PanelController *owner = weakSelf;
-        if (!owner) { [timer invalidate]; return; }
-        // 触发后立即读取；切换应用则取消，避免复制错误窗口。
-        if (NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier != source.processIdentifier || -started.timeIntervalSinceNow > 5) {
-            [timer invalidate]; owner.selectionTimer = nil;
-            return;
-        }
-        NSPasteboard *pasteboard = NSPasteboard.generalPasteboard;
-        if (!copiedAt) {
-            NSEventModifierFlags otherModifiers = NSEvent.modifierFlags & (NSEventModifierFlagCommand | NSEventModifierFlagControl | NSEventModifierFlagShift | NSEventModifierFlagFunction);
-            if (otherModifiers) {
-                [timer invalidate]; owner.selectionTimer = nil;
-                return;
-            }
-            // 复制所有已发布的剪贴板格式，图片和富文本也一并保留。
-            originalChange = pasteboard.changeCount;
-            NSMutableArray *snapshot = [NSMutableArray array];
-            for (NSPasteboardItem *item in pasteboard.pasteboardItems) {
-                NSPasteboardItem *saved = [NSPasteboardItem new];
-                for (NSPasteboardType type in item.types) {
-                    NSData *data = [item dataForType:type];
-                    if (data) [saved setData:data forType:type];
-                }
-                if (saved.types.count) [snapshot addObject:saved];
-            }
-            savedItems = snapshot;
-            if (pasteboard.changeCount != originalChange || NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier != source.processIdentifier) {
-                [timer invalidate]; owner.selectionTimer = nil;
-                return;
-            }
-            // 使用独立按键状态并明确只设置 Command，不继承用户仍按住的 Option。
-            CGEventSourceRef copySource = CGEventSourceCreate(kCGEventSourceStatePrivate);
-            CGEventRef down = copySource ? CGEventCreateKeyboardEvent(copySource, 8, true) : NULL;
-            CGEventRef up = copySource ? CGEventCreateKeyboardEvent(copySource, 8, false) : NULL;
-            if (copySource) CFRelease(copySource);
-            if (!down || !up) {
-                if (down) CFRelease(down);
-                if (up) CFRelease(up);
-                [timer invalidate]; owner.selectionTimer = nil;
-                [owner showWindow:nil];
-                return;
-            }
-            CGEventSetFlags(down, kCGEventFlagMaskCommand);
-            CGEventSetFlags(up, kCGEventFlagMaskCommand);
-            CGEventPostToPid(source.processIdentifier, down);
-            CGEventPostToPid(source.processIdentifier, up);
-            CFRelease(down); CFRelease(up);
-            copiedAt = NSDate.date;
-            return;
-        }
-        if (pasteboard.changeCount == originalChange && -copiedAt.timeIntervalSinceNow < 0.8) return;
-        NSString *selection = @"";
-        if (pasteboard.changeCount != originalChange) {
-            NSInteger copiedChange = pasteboard.changeCount;
-            selection = [[pasteboard stringForType:NSPasteboardTypeString] copy] ?: @"";
-            // 只恢复仍然是本次读取版本的剪贴板，避免覆盖随后发生的更新。
-            if (pasteboard.changeCount == copiedChange) {
-                [pasteboard clearContents];
-                if (savedItems.count) [pasteboard writeObjects:savedItems];
-            }
-        }
-        [timer invalidate]; owner.selectionTimer = nil;
+        if (!owner) return;
         // 无选区时编辑器会复制整行，结果与“选中一整行”完全一致，只能按无选区处理。
-        if (selection.length && !(lineCopyRisk && SynorCopyLooksLikeWholeLine(selection))) [owner presentTranslationText:selection];
+        if (plain.length && !(lineCopyRisk && SynorCopyLooksLikeWholeLine(plain))) [owner presentTranslationText:plain];
         else [owner showWindow:nil];
     }];
-    [NSRunLoop.mainRunLoop addTimer:self.selectionTimer forMode:NSRunLoopCommonModes];
 }
 - (void)presentTranslationText:(NSString *)text {
     if (text.length) self.pendingTranslation = text;
@@ -926,7 +956,7 @@ static BOOL SynorElementIsEditable(AXUIElementRef element) {
     }
     if ([body[@"type"] isEqual:@"open-translation"]) [self showTranslation:nil];
     if ([body[@"type"] isEqual:@"open-settings"]) [self presentSettings];
-    if (([body[@"type"] isEqual:@"chat"] || [body[@"type"] isEqual:@"translate"] || [body[@"type"] isEqual:@"cancel"] || [body[@"type"] isEqual:@"settings-load"] || [body[@"type"] isEqual:@"settings-save"] || [body[@"type"] isEqual:@"models-load"]) && chatRequest) {
+    if (([body[@"type"] isEqual:@"chat"] || [body[@"type"] isEqual:@"translate"] || [body[@"type"] isEqual:@"cancel"] || [body[@"type"] isEqual:@"settings-load"] || [body[@"type"] isEqual:@"settings-save"] || [body[@"type"] isEqual:@"models-load"] || [body[@"type"] isEqual:@"balance-load"]) && chatRequest) {
         if (![body[@"type"] isEqual:@"cancel"] && [body[@"id"] isKindOfClass:NSString.class]) {
             [requestViews setObject:message.webView forKey:body[@"id"]];
         }

@@ -3,11 +3,27 @@ using System.Text.Json;
 
 var root = Path.Combine(Path.GetTempPath(), "synor-tests-" + Guid.NewGuid().ToString("N"));
 Directory.CreateDirectory(root);
+Environment.SetEnvironmentVariable("SYNOR_SETTINGS_DIR", Path.Combine(root, "settings"));
 try
 {
     async Task<(string Text, string? Image, bool IsError)> Run(string name, object args, CancellationToken token = default) =>
         await AgentTools.ExecuteAsync(name, JsonSerializer.SerializeToElement(args), root, _ => { }, token);
     void Check(bool value, string label) { if (!value) throw new Exception(label); Console.WriteLine("PASS " + label); }
+    // 余额字段映射：真实响应形状、不同层级与无效字段不能被误报为零。
+    using (var balanceJson = JsonDocument.Parse("""{"balance_infos":[{"currency":"CNY","total_balance":"110.00"}],"data":{"balance":0,"negative":-1.25,"empty":"","flag":false,"nil":null}}"""))
+    {
+        Check(AiSettings.ReadBalanceField(balanceJson.RootElement, "balance_infos[0].total_balance") == "110.00", "DeepSeek string balance");
+        Check(AiSettings.ReadBalanceField(balanceJson.RootElement, "balance_infos[0].currency") == "CNY", "DeepSeek currency");
+        Check(AiSettings.ReadBalanceField(balanceJson.RootElement, "data.balance") == "0", "numeric zero balance");
+        Check(AiSettings.ReadBalanceField(balanceJson.RootElement, "data.negative") == "-1.25", "negative balance");
+        foreach (var path in new[] { "", "data..balance", "balance_infos[-1].currency", "balance_infos[99].currency", "balance_infos[9999999999999999999].currency", "data.missing", "data.empty", "data.flag", "data.nil", "balance_infos", "data.balance." })
+        {
+            var rejected = false;
+            try { AiSettings.ReadBalanceField(balanceJson.RootElement, path); }
+            catch (Exception error) when (error is ArgumentException or JsonException) { rejected = true; }
+            Check(rejected, "invalid balance field rejected: " + path);
+        }
+    }
     var result = await Run("write", new { path = "nested/a.txt", content = "Alpha\nBeta\nGamma\n" });
     Check(!result.IsError && File.Exists(Path.Combine(root, "nested/a.txt")), "write creates parents");
     result = await Run("read", new { path = "nested/a.txt", offset = 2, limit = 1 });
@@ -101,6 +117,21 @@ try
     catch (HttpRequestException exception) { Check(exception.Message.Contains("401"), "http status surfaced"); }
     await server;
     listener.Stop();
+
+    // 余额持久化必须拒绝旧请求和已切换服务的结果。
+    var balanceSettings = AiSettings.LoadOrSave(new AiSettings { Model = "test", WorkingDirectory = root, BalanceUrl = "https://example.com/balance" });
+    var checkedAt = DateTimeOffset.UtcNow;
+    Check(AiSettings.UpdateBalance(balanceSettings, checkedAt, "20.00", "CNY", null), "saved balance activated");
+    Check(!AiSettings.UpdateBalance(balanceSettings, checkedAt.AddSeconds(-1), "30.00", "CNY", null), "older balance response rejected");
+    Check(AiSettings.LoadOrSave().LastBalance?.Amount == "20.00", "newer balance remains saved");
+    foreach (var changed in new[] { balanceSettings with { BaseUrl = "https://other.example/v1" }, balanceSettings with { BalanceUrl = "https://example.com/other" }, balanceSettings with { BalancePath = "data.balance" }, balanceSettings with { BalanceCurrencyPath = "data.currency" } })
+    {
+        AiSettings.LoadOrSave(changed);
+        Check(AiSettings.LoadOrSave().LastBalance is null, "configuration change clears balance");
+        Check(!AiSettings.UpdateBalance(balanceSettings, checkedAt.AddSeconds(1), "10.00", "CNY", null), "old configuration response rejected");
+        AiSettings.LoadOrSave(balanceSettings);
+        AiSettings.UpdateBalance(balanceSettings, checkedAt, "20.00", "CNY", null);
+    }
 
     // 配置页与模型查询共用同一套基础地址校验。
     Check(AiSettings.NormalizeBaseUrl("  https://example.com/v1/  ") == "https://example.com/v1", "base url trimmed and normalized");

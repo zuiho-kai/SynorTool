@@ -22,12 +22,16 @@ internal static partial class ChatClient
         var removed = false;
         while (history.Count > 2 && JsonSerializer.Serialize(history).Length > maxCharacters)
         {
-            history.RemoveAt(1);
+            // 与 Pi 的切分边界一致：不能从 tool 结果开始保留历史。
+            var next = 2;
+            while (next < history.Count && JsonSerializer.SerializeToElement(history[next]).TryGetProperty("role", out var role) && role.GetString() == "tool") next++;
+            if (next == history.Count) break; // 保留最新完整消息组，即使单组超过限制。
+            history.RemoveRange(1, next - 1);
             removed = true;
         }
 
         if (removed)
-            history.Insert(1, new { role = "system", content = "较早的对话已自动压缩；请仅依据当前保留的消息继续。" });
+            history.Insert(1, new { role = "system", content = "较早的完整消息组已移除；请仅依据当前保留的消息继续。" });
     }
 
     /// <summary>
@@ -95,7 +99,13 @@ internal static partial class ChatClient
             {
                 var savedSettings = AiSettings.LoadOrSave(type == "settings-save"
                     ? root.GetProperty("settings").Deserialize<AiSettings>() ?? throw new JsonException("缺少配置。") : null);
-                SendEvent(JsonSerializer.Serialize(new { id, settings = savedSettings, defaultSystemPrompt = BuiltInSystemPrompt(savedSettings) }));
+                SendEvent(JsonSerializer.Serialize(new { id, settings = savedSettings, defaultSystemPrompt = BuiltInSystemPrompt(savedSettings), balanceChanged = type == "settings-save" }));
+                return;
+            }
+            if (type == "balance-load")
+            {
+                var balanceSettings = root.GetProperty("settings").Deserialize<AiSettings>() ?? throw new JsonException("缺少配置。");
+                _ = LoadBalanceAsync(id, balanceSettings);
                 return;
             }
             if (type == "models-load")
@@ -205,6 +215,36 @@ internal static partial class ChatClient
         }
     }
 
+    /// <summary>查询余额；匹配已保存配置时更新共享余额，独立超时，不影响聊天。</summary>
+    private static async Task LoadBalanceAsync(string id, AiSettings settings)
+    {
+        var started = DateTimeOffset.UtcNow;
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+            using var request = new HttpRequestMessage(HttpMethod.Get, AiSettings.NormalizeBaseUrl(settings.BalanceUrl));
+            request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+            if (!string.IsNullOrWhiteSpace(settings.ApiKey))
+                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", settings.ApiKey.Trim());
+            request.Headers.Add("User-Agent", string.IsNullOrWhiteSpace(settings.UserAgent) ? AiSettings.DefaultUserAgent : settings.UserAgent.Trim());
+            using var response = await Client.SendAsync(request, timeout.Token).ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode) throw new HttpRequestException($"服务返回 HTTP {(int)response.StatusCode}。");
+            using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync(timeout.Token).ConfigureAwait(false));
+            var balance = AiSettings.ReadBalanceField(document.RootElement, settings.BalancePath);
+            var currency = AiSettings.ReadBalanceField(document.RootElement, settings.BalanceCurrencyPath);
+            if (!decimal.TryParse(balance, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out _))
+                throw new JsonException("余额字段不是有效数字。");
+            var balanceChanged = AiSettings.UpdateBalance(settings, started, balance, currency, null);
+            SendEvent(JsonSerializer.Serialize(new { id, balance, currency, balanceChanged }));
+        }
+        catch (Exception exception)
+        {
+            var error = exception is OperationCanceledException ? "余额查询超时。" : $"余额查询失败：{exception.Message}";
+            var balanceChanged = AiSettings.UpdateBalance(settings, started, null, null, error);
+            SendEvent(JsonSerializer.Serialize(new { id, error, balanceChanged }));
+        }
+    }
+
     /// <summary>
     /// 读取 SSE 事件；网络分块由 StreamReader 合并，事件以空行分隔。
     /// </summary>
@@ -253,9 +293,7 @@ internal static partial class ChatClient
                     ReasoningEffort = settings.ReasoningControl ? reasoningEffort : null,
                     Stream = true
                 };
-                PiAi.IAiProvider provider = settings.ApiMode == ApiMode.Responses
-                    ? new PiAi.OpenAiResponsesProvider(Client, settings.BaseUrl, settings.ApiKey, settings.UserAgent)
-                    : new PiAi.OpenAiChatCompletionsProvider(Client, settings.BaseUrl, settings.ApiKey, settings.UserAgent);
+                var provider = new PiAi.OpenAiResponsesProvider(Client, settings.BaseUrl, settings.ApiKey, settings.UserAgent);
                 await foreach (var aiEvent in provider.StreamAsync(request, cancellationToken).ConfigureAwait(false))
                 {
                     switch (aiEvent)
@@ -265,13 +303,13 @@ internal static partial class ChatClient
                         case PiAi.AiReasoningDelta thought:
                             roundFirst ??= elapsed.Elapsed.TotalMilliseconds; firstTokenMs ??= roundFirst; reasoningText.Append(thought.Text); SendEvent(JsonSerializer.Serialize(new { id, reasoning = thought.Text, firstTokenMs })); break;
                         case PiAi.AiReasoningItem item:
-                            if (settings.ApiMode == ApiMode.Responses) reasoningItems.Add(item.Element); break;
+                            reasoningItems.Add(item.Element); break;
                         case PiAi.AiToolCallDelta fragment:
                             if (!toolsEnabled) throw new InvalidOperationException("翻译请求不允许调用工具。");
                             roundFirst ??= elapsed.Elapsed.TotalMilliseconds; firstTokenMs ??= roundFirst;
                             if (!calls.TryGetValue(fragment.Index, out var call)) call = ("", "", new StringBuilder());
                             if (!string.IsNullOrEmpty(fragment.CallId)) call.Id = fragment.CallId;
-                            if (!string.IsNullOrEmpty(fragment.Name)) call.Name += fragment.Name;
+                            if (call.Name.Length == 0 && !string.IsNullOrEmpty(fragment.Name)) call.Name = fragment.Name;
                             if (!string.IsNullOrEmpty(fragment.Arguments)) call.Arguments.Append(fragment.Arguments);
                             calls[fragment.Index] = call; finishReason = PiAi.AiFinishReason.ToolCalls; break;
                         case PiAi.AiUsage usage:
@@ -284,7 +322,9 @@ internal static partial class ChatClient
                             throw new HttpRequestException(error.Message);
                     }
                 }
-                if (!streamDone) throw new IOException("连接提前结束，回答可能不完整，请重试。");
+                if (!streamDone || finishReason == PiAi.AiFinishReason.Unknown) throw new IOException("连接提前结束，回答可能不完整，请重试。");
+                if (finishReason is PiAi.AiFinishReason.Error or PiAi.AiFinishReason.ContentFilter)
+                    throw new IOException("服务未正常完成回答：" + finishReason);
                 if (roundFirst is { } started) generationMs += elapsed.Elapsed.TotalMilliseconds - started;
                 if (!roundUsage) usageComplete = false;
                 SendEvent(JsonSerializer.Serialize(new { id, firstTokenMs, generationMs, usage = usageComplete ? new { prompt_tokens = inputTokens, completion_tokens = outputTokens, total_tokens = totalTokens, cached_tokens = cacheReported ? cachedTokens : (long?)null } : null }));
@@ -292,12 +332,20 @@ internal static partial class ChatClient
                 {
                     if (finishReason == PiAi.AiFinishReason.ToolCalls) throw new IOException("模型声明调用工具，但没有返回有效的 tool_calls。");
                     var answer = new Dictionary<string, object?> { ["role"] = "assistant", ["content"] = text.ToString() };
+                    if (reasoningText.Length > 0) answer["reasoning_content"] = reasoningText.ToString();
+                    if (reasoningItems.Count > 0) answer["reasoning_items"] = reasoningItems.ToArray();
                     generated.Add(answer);
                     SendEvent(JsonSerializer.Serialize(new { id, apiMessages = generated }));
-                    SendEvent(JsonSerializer.Serialize(new { id, done = true, elapsedMs = elapsed.Elapsed.TotalMilliseconds, generationMs, cumulative = usageComplete ? PersistUsage(inputTokens, outputTokens, totalTokens, cachedTokens) : null }));
+                    SendEvent(JsonSerializer.Serialize(new { id, done = true, stopReason = finishReason.ToString(), elapsedMs = elapsed.Elapsed.TotalMilliseconds, generationMs, cumulative = usageComplete ? PersistUsage(inputTokens, outputTokens, totalTokens, cachedTokens) : null }));
+                    if (toolsEnabled)
+                    {
+                        var current = AiSettings.LoadOrSave();
+                        if (current.LastBalance is not null && settings.SameBalanceConfiguration(current))
+                            _ = LoadBalanceAsync(Guid.NewGuid().ToString(), current);
+                    }
                     return;
                 }
-                if (finishReason is not (PiAi.AiFinishReason.ToolCalls or PiAi.AiFinishReason.Stop)) throw new IOException("工具参数生成未完成，未执行工具。请重试。");
+                if (finishReason is not (PiAi.AiFinishReason.ToolCalls or PiAi.AiFinishReason.Stop or PiAi.AiFinishReason.Length)) throw new IOException("工具参数生成未完成，未执行工具。请重试。");
                 if (calls.Values.Any(c => c.Id.Length == 0 || c.Name.Length == 0) || calls.Values.Select(c => c.Id).Distinct().Count() != calls.Count) throw new IOException("模型返回的工具调用标识无效。");
                 var assistant = new Dictionary<string, object?>
                 {
@@ -306,9 +354,8 @@ internal static partial class ChatClient
                     ["tool_calls"] = calls.Values.Select(c => new { id = c.Id, type = "function", function = new { name = c.Name, arguments = c.Arguments.ToString() } }).ToArray()
                 };
                 if (reasoningText.Length > 0) assistant["reasoning_content"] = reasoningText.ToString();
-                if (settings.ApiMode == ApiMode.Responses && reasoningItems.Count > 0) assistant["reasoning_items"] = reasoningItems.ToArray();
+                if (reasoningItems.Count > 0) assistant["reasoning_items"] = reasoningItems.ToArray();
                 history.Add(assistant); generated.Add(assistant);
-                CompactHistory(history, settings.ContextCompressionBytes);
                 pendingCalls.AddRange(calls.Values.Select(c => (c.Id, c.Name, c.Arguments.ToString())));
                 SendEvent(JsonSerializer.Serialize(new { id, apiMessages = generated.Concat(pendingCalls.Select(c => (object)new { role = "tool", tool_call_id = c.Id, content = "Tool execution is pending or interrupted; inspect actual state before relying on its result." })).ToArray() }));
                 var images = new List<object>();
@@ -319,9 +366,14 @@ internal static partial class ChatClient
                     (string Text, string? Image, bool IsError) result;
                     try
                     {
-                        using var args = JsonDocument.Parse(call.Arguments.ToString());
-                        result = await AgentTools.ExecuteAsync(call.Name, args.RootElement, cwd,
-                            output => SendEvent(JsonSerializer.Serialize(new { id, tool = new { callId = call.Id, status = "running", output } })), cancellationToken).ConfigureAwait(false);
+                        if (finishReason == PiAi.AiFinishReason.Length)
+                            result = ($"Tool call {call.Name} was not executed: the response hit the output token limit. Re-issue the tool call with complete arguments.", null, true);
+                        else
+                        {
+                            using var args = JsonDocument.Parse(call.Arguments.ToString());
+                            result = await AgentTools.ExecuteAsync(call.Name, args.RootElement, cwd,
+                                output => SendEvent(JsonSerializer.Serialize(new { id, tool = new { callId = call.Id, status = "running", output } })), cancellationToken).ConfigureAwait(false);
+                        }
                     }
                     catch (JsonException exception) { result = ($"Invalid tool arguments: {exception.Message}", null, true); }
                     SendEvent(JsonSerializer.Serialize(new { id, tool = new { callId = call.Id, status = result.IsError ? "error" : "done", output = result.Text, image = result.Image } }));
@@ -330,7 +382,7 @@ internal static partial class ChatClient
                     pendingCalls.RemoveAll(c => c.Id == call.Id);
                     if (result.Image is { } image)
                     {
-                        // Chat Completions 工具消息通常只接受文本，图片用紧随其后的用户多模态消息承载。
+                        // 内部工具结果保存文本，图片由紧随其后的用户多模态消息承载并转换为 Responses 输入。
                         var imageMessage = new { role = "user", content = new object[] { new { type = "text", text = $"Image returned by read tool {call.Id}:" }, new { type = "image_url", image_url = new { url = image } } } };
                         images.Add(imageMessage);
                     }

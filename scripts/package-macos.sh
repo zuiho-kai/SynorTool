@@ -4,7 +4,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 # 固定本机签名证书指纹；证书私钥只保存在登录钥匙串，不能自动重建或回退临时签名。
 signing_identity="F02844FCD1930CC89593D75F847682C1E7FAA50B"
 signing_keychain="$HOME/Library/Keychains/login.keychain-db"
-install_path="$HOME/Applications/Synor.app"
+install_path="/Applications/Synor.app"
 identities="$(security find-identity -p codesigning "$signing_keychain")"
 if [[ "$identities" != *"$signing_identity"* ]]; then
     printf '缺少固定的 Synor Local Development 签名身份，请恢复原钥匙串；已停止打包。\n' >&2
@@ -49,8 +49,8 @@ codesign --force --sign "$signing_identity" --keychain "$signing_keychain" --tim
 codesign --verify --deep --strict "$app"
 codesign --verify --strict -R="$requirement" "$app"
 # 所有验证通过后才更新固定安装位置；dist 仅保留入口，避免重复安装副本。
-mkdir -p "$HOME/Applications"
-install_stage="$(mktemp -d "$HOME/Applications/.synor-install.XXXXXX")"
+mkdir -p "/Applications"
+install_stage="$(mktemp -d "/Applications/.synor-install.XXXXXX")"
 trap 'rm -rf "$stage" "$install_stage"' EXIT
 ditto "$app" "$install_stage/Synor.app"
 codesign --verify --deep --strict -R="$requirement" "$install_stage/Synor.app"

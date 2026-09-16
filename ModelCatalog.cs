@@ -35,7 +35,7 @@ internal static class ModelCatalog
         var body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode)
         {
-            throw new HttpRequestException($"服务返回 HTTP {(int)response.StatusCode}，请检查基础地址、API Key 与 API 模式。");
+            throw new HttpRequestException($"服务返回 HTTP {(int)response.StatusCode}，请检查基础地址与 API Key。");
         }
         try
         {

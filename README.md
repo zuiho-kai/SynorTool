@@ -1,94 +1,157 @@
-# Synor 聊天 Demo
+<p align="center">
+  <img src="Assets/BrandIcon.png" width="112" alt="SynorTool 图标" />
+</p>
 
-.NET 10 启动原生 AppKit 标准玻璃窗口，内部 WKWebView 加载本地 React 页面。
-使用 assistant-ui 管理消息与输入，使用 Streamdown 渲染 Markdown。
+<h1 align="center">SynorTool</h1>
+<p align="center">Synor 旗下的 macOS AI 桌面工具</p>
+<p align="center">AI 对话 · 选区翻译 · 本地 Agent 工具</p>
 
-## 运行
+SynorTool 是 Synor 的第一款产品，将 AI 对话、快捷翻译与本地工具调用整合到原生 macOS 菜单栏应用中。连接你自己的本地或远程模型服务，连按两次 Option，即可在当前工作中唤起助手。
 
-需要 macOS 26+、Xcode macOS 26 SDK、.NET SDK 10.0.400，以及 Node.js / npm。
+项目使用 .NET 10、AppKit 和 React 构建，采用原生 Liquid Glass 窗口。我们选择开源，让使用者能够了解实现、反馈问题，并参与改善产品。
+
+> **当前为早期版本，面向愿意从源码构建的 macOS 用户。** 当前构建路径面向 Apple Silicon 和 macOS 26+，尚未完成 Developer ID 签名与 Apple 公证。
+>
+> **使用前请了解 Agent 权限：** 聊天默认启用文件读取、写入和 shell 执行工具，以当前 macOS 用户权限自动执行，没有逐次确认或沙箱。工作目录仅用于解析相对路径，不限制访问范围。工具读取的内容可能随对话发送至你配置的模型服务，请仅在理解这些权限与数据流向后使用。
+
+## 主要功能
+
+- **随时唤起**：常驻菜单栏，连按两次左或右 Option 显示窗口；Esc 隐藏，隐藏后保留当前对话。
+- **流式 AI 对话**：支持多轮上下文、停止生成、Markdown 与数学公式渲染、复制回答和剪贴板图片输入。图片理解需要模型支持视觉。
+- **快捷翻译**：选中文字后连按两次 Option，将选区带入独立翻译窗口；支持目标语言选择、流式输出、停止和复制。翻译不启用 Agent 工具。
+- **本地 Agent**：提供 `read`、`grep`、`find`、`ls`、`write`、`edit`、`bash` 和 `web_fetch`，可查看工具调用的参数、状态与输出。
+- **自选模型服务**：连接支持 OpenAI Responses API 的服务，配置基础地址、模型、API Key、附加提示词和思考控制，并从服务端获取模型列表。
+- **用量信息**：显示首 Token 耗时、输出速度、上下文与累计 Token 用量；服务端返回缓存数据时显示缓存率。用量以服务端返回值为准。
+
+## 从源码运行
+
+### 环境要求
+
+- Apple Silicon Mac，macOS 26 或更高版本。
+- Xcode 及 macOS 26 SDK，确保 `xcrun clang` 可用。
+- .NET SDK **10.0.400**（允许更新的同系列补丁版本，见 `global.json`）。
+- Node.js 与 npm，用于安装、检查和构建前端。
+- 一个支持 **OpenAI Responses API** 的本地或远程模型服务。
 
 ```sh
-cd /Users/fengying/Desktop/SynorTool
+git clone https://github.com/gtjaorg/SynorTool.git
+cd SynorTool
 npm --prefix Web ci
 dotnet run
 ```
 
-`dotnet build` 会运行 TypeScript 检查、打包前端、编译原生桥接并复制网页到输出目录。
-页面打包为本地单文件，不需要开发服务器，也不请求远程前端资源。
+构建会检查 TypeScript、打包前端并编译原生桥接库。前端以本地单文件加载，无需启动开发服务器。仓库附带的 ripgrep / fd 为 Apple Silicon 二进制。
 
-## 体验
+### 配置模型
 
-- 默认连接 LM Studio，可先启动本地服务器 `http://127.0.0.1:1234`，加载 `google/gemma-4-e4b`。
-- 点击输入框底部“配置”，或菜单栏右键菜单“AI 配置…”，打开独立原生玻璃窗口，填写 API 模式（Responses 或 Chat Completions）、OpenAI 兼容 API 基础地址、模型、API Key 与系统提示词。配置和密钥保存在应用数据目录 `~/Library/Application Support/Synor/settings.json`（含 API Key，文件权限仅当前用户可读写），重启后保留。配置在独立窗口内编辑，不跳转聊天页面，也不影响正在进行的对话。
-- 地址包含版本路径（例如 `/v1`），不包含具体接口路径；远程服务要求 HTTPS，本机可使用 HTTP。LM Studio 与 CLIProxyAPI 均可按服务端支持选择 API 模式。
-- “模型名称”旁的“获取列表”会按当前填写的基础地址与 API Key 请求服务端的 `/models`，读取结果填入可输入的候选项，仍可手动输入。服务未提供该接口、认证失败或列表为空时会提示原因；列表只用于本次配置，不写入配置文件。
-- 保存对下一次请求生效，系统提示词作为首条 `system` 消息发送。配置窗口中 Esc、取消或保存后都会返回聊天；取消不保存。
-- 服务不接受 `reasoning_effort` 时，在配置页关闭“发送思考控制参数”。
-- 输入框底部可开关思考模式，并在 low/high/max 间选择思考强度（默认 high），对下一次请求生效；生成中禁用切换。关闭思考模式时发送 `reasoning_effort: none`，配置中关闭“发送思考控制参数”则完全不携带该字段；设置保留至本次运行结束。
-- 输入消息后 Enter 发送，Shift + Enter 换行；生成中可以停止。
-- 在输入框粘贴剪贴板图片，显示缩略图并可移除；支持仅图片发送，图片随消息发送到已配置的 AI 服务，需选择支持视觉的模型。
-- 模型返回 `reasoning_content` 时流式展开思考过程，正文开始后自动收起，点击可重新展开；不返回该字段时不显示思考区。
-- 每次请求携带当前分支的消息历史，支持多轮对话；停止会取消底层 HTTP 请求。
-- “复制回答”旁显示该次请求的首 Token 本地耗时（含首个思考片段）与服务端输出 Token，形如 `首 Token 0.50 s 速度 40.0 Token/s ↓51 Token`；大数用 k/M 缩写，悬停可查看精确值；输出包含思考 Token，提前停止且未收到用量时显示未返回。
-- 底部提示栏在 `Shift + Enter 换行` 旁显示当前上下文 `上下文 ↑9k`（取最近一次带用量的请求，因为每次请求都携带完整历史，所以最新一次的输入即当前上下文大小；新一轮生成用量返回前沿用上一次的值），再接累计用量 `累计 ↑1.2M ↓123k | 1.3M`。累计值随每次回答写入配置文件，软件重启、重新开聊或清理上下文后都继续累加，不会清零。服务端上报缓存时再接一段 `缓存率 90%`（累计命中缓存 ÷ 累计输入 Token，兼容 OpenAI `*_tokens_details.cached_tokens` 与 Anthropic 风格 `cache_read_input_tokens`），悬停可看原始值，未上报则不显示。
-- 回答支持 Markdown、滚动、复制；代码仅展示，不执行，也尚未加入语法高亮。
-- 输入框底部与菜单栏右键菜单提供独立原生浮动窗口“快捷翻译”：自动识别原文语言，选择目标语言后点击翻译，支持流式输出、停止和复制译文；复用当前服务配置，使用独立翻译提示词，不带入聊天历史。
-- 在其他应用中选中文字后连按两次 Option，会将可读取的选区填入翻译面板；不自动发送，不修改剪贴板。读取顺序：焦点元素 → 子树 → 祖先元素（网页的跨节点选区由 `AXWebArea` 报告），依次尝试 `AXSelectedText`、Text Marker、选区范围参数化属性和整段文本切片。应用不支持读取选区时请手动粘贴。
-- 前台是 Codex（`com.openai.codex`）且选区在**可编辑控件**（发送框）时，改为后台自动翻译并把译文就地替换回原选区，不弹出翻译面板；输入框内容在翻译期间被改动则放弃回填。选区在 AI 回复等静态文本上（无可写回位置）时仍走翻译面板。
-- Chromium / Electron 默认不构建辅助功能树（Chrome、VSCode、Cursor 等），读不到选区时会按业界做法（selection-hook、SuperCmd 均为同一方案）对前台应用设置 `AXEnhancedUserInterface` 与 `AXManualAccessibility`，幂等且不还原：第一次按仍然走下面的复制兜底，之后即可直接用辅助功能读到选区。代价是目标应用会构建完整辅助功能树（Chrome 有内存与渲染开销），VSCode 等 Electron 编辑器会进入屏幕阅读器优化模式，仅本次运行生效，不写入它的配置。
-- 仍然读不到时（自绘应用、Sublime 等）才模拟一次 ⌘C：复制前备份剪贴板，复制后轮询 `changeCount`，读完还原。部分编辑器没有选区时按 ⌘C 会复制整行（VSCode 的 `editor.emptySelectionClipboard`），结果与“选中一整行”完全无法区分，因此这类应用的复制结果若为“单行 + 行尾换行”，按无选区处理，只显示聊天窗口，不填写翻译面板。
-- 单独连按两次左或右 Option（两次间隔小于系统双击间隔）即可显示窗口；组合键、鼠标点击或滚动会取消本次计数。首次需在“系统设置 → 隐私与安全性 → 辅助功能”中允许 Synor，然后点击菜单栏图标使权限生效；右键菜单也提供权限入口。
-- 原生顶部可拖动，Esc 隐藏窗口；菜单栏图标左键显示窗口，右键可显示、隐藏或退出。隐藏保留聊天，退出后聊天记录清空，聊天、翻译、配置三个窗口各自记住上次的位置与大小（存在 `~/Library/Preferences/com.synor.tool.plist`），首次运行或显示器变化导致位置失效时自动居中。
+点击输入框底部“配置”，或菜单栏右键菜单中的“AI 配置…”，填写：
 
-聊天工具请求持续执行直到完成或用户停止；bash 可由模型指定 timeout 秒数。
-网页仍禁止直接网络请求和任意 HTML；通过受限的原生桥交由 .NET 发起请求。
+| 配置项 | 说明 |
+| --- | --- |
+| API 基础地址 | 包含版本路径，例如 `http://127.0.0.1:1234/v1`；不要填写 `/responses` 等具体接口路径 |
+| 模型 | 填写服务实际提供的模型标识，或通过“获取列表”从 `/models` 选择 |
+| API Key | 按服务要求填写；本地无认证服务可留空 |
+| 思考控制 | 服务不接受思考参数时，关闭“发送思考控制参数” |
+| 工作目录 | Agent 解析相对路径的起点，不构成权限隔离 |
 
-系统降低透明度设置会影响玻璃外观。单窗口截图可能丢失玻璃背后的内容，
-应以实际屏幕显示为准。
+默认地址指向本机 LM Studio 服务，默认模型标识为 `google/gemma-4-e4b`；请根据实际加载的模型调整。远程服务要求 HTTPS，本机可使用 HTTP。仅支持 Chat Completions 的服务无法直接使用，所选服务与模型也需要支持你要使用的图片、工具调用等能力。
 
-聊天页面背景透明，透出下方原生标准玻璃；输入框、代码块、表格保留独立底色。
-当前通过 KVC 关闭 WKWebView 的内部 `drawsBackground` 属性。这不是公开 API，
-系统升级时需要验证兼容性，不能视为已完成正式分发兼容性验证。
+保存配置对下一次请求生效。聊天和翻译可以同时生成，停止操作相互独立。
 
-## 打包 macOS App
+## 使用方式
 
-```sh
-./scripts/package-macos.sh
-open dist/Synor.app
-```
+| 操作 | 效果 |
+| --- | --- |
+| 连按两次左或右 Option | 唤起窗口；能读取选区时进入翻译流程 |
+| Enter / Shift + Enter | 发送消息 / 换行 |
+| 粘贴图片 | 添加图片附件，可移除，也可仅发送图片 |
+| Esc | 隐藏当前窗口 |
+| 清理按钮 / ⌘L | 清空聊天上下文并取消正在进行的请求 |
+| 菜单栏图标左键 / 右键 | 显示窗口 / 打开菜单 |
 
-应用固定安装到 `~/Applications/Synor.app`，`dist/Synor.app` 是指向该位置的符号链接。适用于 Apple Silicon、macOS 26+，包含 .NET 10 运行时，无需额外安装 .NET。
-应用常驻菜单栏，不显示 Dock 图标；再次打开 App 会显示已有窗口。
-固定使用登录钥匙串中的 `Synor Local Development` 本机签名证书，应用标识保持 `com.synor.tool`。打包脚本锁定证书指纹，身份不可用时停止，不生成新证书，也不回退 ad-hoc。私钥不在仓库中；请保留原登录钥匙串。
+全局快捷键与选区读取需要在“系统设置 → 隐私与安全性 → 辅助功能”中授权。授权后点击菜单栏图标使权限生效。无法读取选区的应用可手动粘贴文字。
 
-从旧临时签名切换后首次可能需要重新授予辅助功能或钥匙串访问权限。后续构建保持同一证书与安装位置。当前证书用于本机开发，尚未进行 Developer ID 签名与 Apple 公证。
+选区读取优先使用辅助功能接口；必要时会模拟 ⌘C，并备份、恢复剪贴板。对于 Chromium / Electron 应用，可能启用其辅助功能树，带来额外开销或屏幕阅读器模式变化。
 
-翻译窗口可以单独拖动和调整大小；Esc 只隐藏翻译窗口，再次打开保留内容。聊天与翻译可同时生成，取消操作相互独立。
+在 Codex 的可编辑输入框内选中文字时，快捷翻译会尝试将译文替换回原选区；翻译期间输入内容发生变化时会放弃回填。静态文本选区仍使用翻译面板。
+
+## 数据与权限
+
+- 配置与 API Key 存储在 `~/Library/Application Support/Synor/settings.json`，文件权限限制为当前用户读写。**API Key 保存在 JSON 中，并非钥匙串加密存储**；不要上传该文件。
+- 对话、图片及工具结果会按请求发送到你配置的模型服务。接入远程服务时，应自行了解该服务的数据处理方式。
+- 退出应用后聊天记录清空；累计 Token 用量保存在配置文件中。窗口位置和大小保存在 `~/Library/Preferences/com.synor.tool.plist`。
+- `bash` 完整输出可能写入系统临时目录，路径会返回给模型；工具结果在界面和上下文中可能被截断。
+- 网页前端通过原生桥请求后端，不直接发起任意网络请求；这不限制后端 Agent 的系统权限。
 
 ## Agent 工具
 
-聊天默认启用 `read`、`grep`、`find`、`ls`、`write`、`edit`、`bash`、`web_fetch`，以当前 macOS 用户权限自动执行，无逐次确认或沙箱。配置页可设置工作目录；相对路径基于该目录，绝对路径和 `~` 也可使用。工作目录不限制访问范围。翻译请求不开放工具。
+| 工具 | 能力 |
+| --- | --- |
+| `read` | 读取文本和图片，支持文本分页 |
+| `grep` / `find` / `ls` | 搜索内容、查找文件、列出目录，搜索使用随附的 ripgrep / fd |
+| `write` / `edit` | 写入文件、替换文本；替换会检查匹配唯一性与重叠 |
+| `bash` | 执行 `/bin/bash -c`，支持超时、输出和取消进程树；调用之间不保留 shell 状态 |
+| `web_fetch` | 获取 HTTP(S) 页面、纯文本或 JSON，将网页正文转换为简洁 Markdown |
 
-- `read` 支持文本分页和图片；文本最多返回 2000 行或 50KB，图片通过 macOS sips 转为不超过 2000 像素的 PNG。
-- `grep` / `find` 使用随应用附带的 ripgrep / fd，支持 glob 和忽略规则；`ls` 包括隐藏文件。
-- `write` 创建父目录并写入 UTF-8；`edit` 支持同一文件多处替换，拒绝不唯一或重叠匹配，保留 BOM/换行格式，返回差异。
-- `bash` 使用 `/bin/bash -c`，支持流式输出、退出状态、timeout 和取消进程树。各次调用不保留 `cd` 或环境变量。输出展示末尾 2000 行/50KB，完整日志写入系统临时目录，路径返回模型。
-- 工具调用卡片展示参数、状态和输出，可以展开查看。工具结果随下一轮聊天保留，清理按钮或 ⌘L 清空上下文并取消正在进行的请求。
-- Token 用量累加各次模型请求并写入配置文件：单条回答只显示本轮输出，累计输入/输出/合计与缓存率常驻底部；平均 Token/s 排除工具执行和各轮首 Token 等待时间，服务端缺少用量时不估算，也不计入累计。
-- 默认提示词参考 Pi，配置页的提示词作为附加指令。参考版本与许可证见 `ThirdParty/`。只移植七个工具及调用流程，不包含 Pi 的技能、扩展或会话持久化。
+`web_fetch` 不执行 JavaScript、不使用浏览器登录态、不解析 PDF 或图片。网页内容属于不可信外部数据。Agent 工具调用可持续执行，直到任务完成或用户停止。
 
-验证：
+工具行为与提示词参考 Pi Coding Agent，相关来源和许可见 [ThirdParty](ThirdParty/README.md)。当前实现不包含 Pi 的技能、扩展或会话持久化。
+
+## 开发与验证
 
 ```sh
+# 构建前端、.NET 应用及原生桥接
+dotnet build
+
+# 工具行为测试
 dotnet run --project Tests/ToolTests.csproj
+
+# 使用本地模拟服务验证流式请求与工具循环
 python3 Tests/stream_test.py
-./scripts/package-macos.sh
 ```
 
-前两项在临时目录内验证工具行为和模拟 SSE 多轮调用，不调用真实模型，也不读写应用配置。
+测试使用临时目录；流式测试通过 `SYNOR_SETTINGS_DIR` 隔离配置，不调用真实模型，也不读写日常使用的应用配置。
 
-### 网页读取
+| 目录或文件 | 内容 |
+| --- | --- |
+| `NativePanel.m`、`SynorMarkdown.*` | 原生窗口、系统交互与选区 Markdown 转换 |
+| `ChatClient.cs`、`PiAi/` | 对话流程与 OpenAI Responses 适配 |
+| `AgentTools.cs`、`WebFetch.cs` | 本地工具与网页读取 |
+| `Web/` | React 聊天、翻译及配置界面 |
+| `Tests/` | 工具行为与流式集成测试 |
+| `ThirdParty/`、`Tools/` | 第三方声明、许可证与随附工具 |
 
-`web_fetch` 接受 `url`，使用 C# HttpClient 获取 HTTP(S) 网页，以 HtmlAgilityPack 提取正文，返回来源 URL、标题与简洁 Markdown；也可读取纯文本和 JSON。支持相对重定向（最多 5 次）、中文字符集、取消请求；30 秒超时，解压后的响应最多 2 MB，返回最多 2000 行 / 50 KB，超出时标明截断。无需第三方抓取服务或 API Key。
+### SDK 选择问题
 
-这是网页读取工具，不执行 JavaScript、不使用浏览器登录态，也不解析 PDF 或图片。参考 [Pi webfetch 插件](https://github.com/k3dom/pi-plugins/tree/master/plugins/webfetch) 的抓取、转换和截断流程，以 C# 独立实现。网页内容按不可信外部数据处理，不作为用户指令。
+若本机同时安装多个 SDK，遇到 `unknown architecture: arm64e.x1` 或 `tapi error: malformed file`，请检查编译器与默认 SDK 是否匹配。本次验证使用 macOS 26.5 SDK；若本机存在下列路径，可为命令显式指定：
+
+```sh
+SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk dotnet build
+SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk python3 Tests/stream_test.py
+```
+
+### 本机打包脚本
+
+`scripts/package-macos.sh` 是维护者的本机开发打包脚本，依赖固定的本地签名证书与登录钥匙串，**不能在其他机器上直接作为通用安装脚本使用**。它会安装到 `/Applications/Synor.app`，并创建 `dist/Synor.app` 符号链接。
+
+社区开发请优先使用上述源码运行方式。现有脚本产物包含 .NET 运行时，但尚未完成 Developer ID 签名与 Apple 公证。
+
+### 已知限制
+
+- 当前仅提供 macOS 实现；附带工具与打包脚本面向 Apple Silicon。
+- 使用 KVC 调整 WKWebView 的 `drawsBackground`，该属性不是公开 API，系统升级时需要验证兼容性。
+- 选区读取和回填取决于目标应用的辅助功能支持，并非所有应用都可用。
+- 工具执行没有逐次确认或沙箱；当前版本不适合需要严格权限隔离的场景。
+- 图片、思考输出、缓存与 Token 用量等能力取决于模型服务支持。
+
+## 反馈与贡献
+
+欢迎在 [Issues](https://github.com/gtjaorg/SynorTool/issues) 提交问题与建议，或通过 Pull Request 贡献改进。
+
+报告问题时，请提供 macOS 版本、芯片类型、复现步骤，以及已去除敏感信息的错误输出。模型相关问题请注明服务类型与模型标识；不要提交 API Key、完整配置文件或私人对话。
+
+修改代码前请阅读 [AGENTS.md](AGENTS.md)，提交与问题直接相关的修改，并运行相应构建或测试。较大的功能调整建议先通过 Issue 讨论范围。
+
+## 许可证
+
+SynorTool 项目代码采用 [MIT License](LICENSE)。随附的第三方代码、工具和依赖遵循各自许可证，已有声明见 [ThirdParty](ThirdParty/README.md)。

@@ -137,6 +137,56 @@ internal static class AgentTools
         return tail ? "[Output truncated; showing tail]\n" + result : result + "\n[Output truncated]";
     }
 
+    /// <summary>执行前按现有工具定义校验参数；仅覆盖本项目实际使用的 Schema 关键字。</summary>
+    private static void ValidateArguments(string name, JsonElement args)
+    {
+        var definition = Definitions.Select(definition => JsonSerializer.SerializeToElement(definition))
+            .FirstOrDefault(item => item.GetProperty("function").GetProperty("name").GetString() == name);
+        if (definition.ValueKind == JsonValueKind.Undefined) throw new ArgumentException($"Tool {name} not found");
+        Validate(args, definition.GetProperty("function").GetProperty("parameters"), name);
+
+        static void Validate(JsonElement value, JsonElement schema, string path)
+        {
+            var type = schema.GetProperty("type").GetString();
+            var valid = type switch
+            {
+                "object" => value.ValueKind == JsonValueKind.Object,
+                "array" => value.ValueKind == JsonValueKind.Array,
+                "string" => value.ValueKind == JsonValueKind.String,
+                "boolean" => value.ValueKind is JsonValueKind.True or JsonValueKind.False,
+                "integer" => value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out _),
+                "number" => value.ValueKind == JsonValueKind.Number && value.TryGetDouble(out var number) && double.IsFinite(number),
+                _ => false
+            };
+            if (!valid) throw new ArgumentException($"Invalid tool arguments: {path} must be {type}.");
+            if (type == "object")
+            {
+                var properties = schema.GetProperty("properties");
+                if (schema.TryGetProperty("required", out var required))
+                    foreach (var field in required.EnumerateArray())
+                        if (!value.TryGetProperty(field.GetString()!, out _)) throw new ArgumentException($"Invalid tool arguments: missing {path}.{field.GetString()}.");
+                foreach (var property in value.EnumerateObject())
+                {
+                    if (!properties.TryGetProperty(property.Name, out var propertySchema)) throw new ArgumentException($"Invalid tool arguments: unknown {path}.{property.Name}.");
+                    Validate(property.Value, propertySchema, path + "." + property.Name);
+                }
+            }
+            else if (type == "array")
+            {
+                if (schema.TryGetProperty("minItems", out var minimum) && value.GetArrayLength() < minimum.GetInt32())
+                    throw new ArgumentException($"Invalid tool arguments: {path} has too few items.");
+                foreach (var item in value.EnumerateArray()) Validate(item, schema.GetProperty("items"), path + "[]");
+            }
+            else if (type is "integer" or "number")
+            {
+                var number = value.GetDouble();
+                if ((schema.TryGetProperty("minimum", out var minimum) && number < minimum.GetDouble()) ||
+                    (schema.TryGetProperty("exclusiveMinimum", out var exclusive) && number <= exclusive.GetDouble()))
+                    throw new ArgumentException($"Invalid tool arguments: {path} is below the minimum.");
+            }
+        }
+    }
+
     /// <summary>
     /// 执行一个工具，工具错误返回模型以便修正，取消继续向上抛出。
     /// </summary>
@@ -151,7 +201,7 @@ internal static class AgentTools
         try
         {
             token.ThrowIfCancellationRequested();
-            if (args.ValueKind != JsonValueKind.Object) throw new ArgumentException("工具参数必须是 JSON 对象。");
+            ValidateArguments(name, args);
             if (name == "bash")
             {
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);

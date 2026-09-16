@@ -29,7 +29,7 @@ export function Translation() {
         setBusy(false);requestId.current='';
         if(payload.error)setError(payload.error);
         else if(!answer.current)setError('模型没有返回译文，请重试。');
-        else window.webkit?.messageHandlers.synor.postMessage({type:'replace-chat-box',text:answer.current});
+        // Keep the translated result in the translation window; do not write it to Synor's composer.
       }
     };
     window.addEventListener('synor-chat',receive);
