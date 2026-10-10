@@ -508,14 +508,25 @@ static BOOL SynorElementIsEditable(AXUIElementRef element) {
     }
     self.lastOptionTap = now;
 }
-// 连按两次 Option 后执行：有可读选区则翻译，否则复制选区或显示聊天窗口。
+// 连按两次 Option 后执行：有可读选区则翻译；Codex 输入框无选区时翻译整个输入；否则复制选区或显示聊天窗口。
 - (void)triggerOptionShortcut {
     NSString *selection = [self selectedTextFromFrontmostApp];
     NSRunningApplication *app = NSWorkspace.sharedWorkspace.frontmostApplication;
     AXUIElementRef focused = NULL;
-    if (selection.length && app && app.processIdentifier != NSProcessInfo.processInfo.processIdentifier) {
+    if (!self.selectionIsSecure && [app.bundleIdentifier isEqual:@"com.openai.codex"]) {
         AXUIElementRef axApp = AXUIElementCreateApplication(app.processIdentifier);
-        if (AXUIElementCopyAttributeValue(axApp, kAXFocusedUIElementAttribute, (CFTypeRef *)&focused) == kAXErrorSuccess && [self beginBackgroundTranslationIfPossible:selection element:focused application:app]) { CFRelease(focused); CFRelease(axApp); return; }
+        AXUIElementSetMessagingTimeout(axApp, 0.25);
+        BOOL wholeInput = !selection.length;
+        if (AXUIElementCopyAttributeValue(axApp, kAXFocusedUIElementAttribute, (CFTypeRef *)&focused) == kAXErrorSuccess && focused) {
+            NSString *text = selection;
+            // 没有选区时读取整个输入框作为原文。
+            if (wholeInput && SynorElementIsEditable(focused)) {
+                CFTypeRef value = NULL;
+                if (AXUIElementCopyAttributeValue(focused, kAXValueAttribute, &value) == kAXErrorSuccess && value && CFGetTypeID(value) == CFStringGetTypeID()) text = [(__bridge NSString *)value copy];
+                if (value) CFRelease(value);
+            }
+            if ([text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet].length && [self beginBackgroundTranslationIfPossible:text element:focused application:app wholeInput:wholeInput]) { CFRelease(focused); CFRelease(axApp); return; }
+        }
         if (focused) CFRelease(focused); CFRelease(axApp);
     }
     if (!selection.length) { [self copySelectionOrShowChat]; return; }
@@ -611,8 +622,8 @@ static BOOL SynorElementIsEditable(AXUIElementRef element) {
     return text;
 }
 
-- (BOOL)beginBackgroundTranslationIfPossible:(NSString *)text element:(AXUIElementRef)element application:(NSRunningApplication *)application {
-    if (!text.length || !element || !application || ![application.bundleIdentifier isEqual:@"com.openai.codex"] || !chatRequest) return NO;
+- (BOOL)beginBackgroundTranslationIfPossible:(NSString *)text element:(AXUIElementRef)element application:(NSRunningApplication *)application wholeInput:(BOOL)wholeInput {
+    if (!text.length || text.length > 16000 || !element || !application || ![application.bundleIdentifier isEqual:@"com.openai.codex"] || !chatRequest) return NO;
     // 静态选区（例如 AI 回复正文）没有可写回的输入框，交给翻译面板处理。
     if (!SynorElementIsEditable(element)) return NO;
     // 记录全框原值与选区范围：之后按范围做就地替换，而不是用译文覆盖整个输入框。
@@ -620,8 +631,8 @@ static BOOL SynorElementIsEditable(AXUIElementRef element) {
     NSString *fullText = nil;
     if (AXUIElementCopyAttributeValue(element, kAXValueAttribute, &value) == kAXErrorSuccess && value && CFGetTypeID(value) == CFStringGetTypeID()) fullText = [(__bridge NSString *)value copy];
     if (value) CFRelease(value);
-    // 没有可核对的原值快照就无法安全写回，交给翻译面板处理。
-    if (!fullText) return NO;
+    // 没有可核对的原值快照就无法安全写回，交给翻译面板处理；整框翻译时快照必须与原文一致。
+    if (!fullText || fullText.length > 16000 || (wholeInput && ![fullText isEqualToString:text])) return NO;
     NSRange selection = NSMakeRange(NSNotFound, 0);
     CFTypeRef range = NULL;
     if (AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute, &range) == kAXErrorSuccess && range && CFGetTypeID(range) == AXValueGetTypeID()) {
@@ -629,6 +640,8 @@ static BOOL SynorElementIsEditable(AXUIElementRef element) {
         if (AXValueGetValue((AXValueRef)range, kAXValueCFRangeType, &selected)) selection = NSMakeRange((NSUInteger)selected.location, (NSUInteger)selected.length);
     }
     if (range) CFRelease(range);
+    // 无选区时覆盖全文，不能把译文插入零长度光标位置。
+    if (wholeInput) selection = NSMakeRange(0, fullText.length);
     // 选区范围必须落在原值内且与读到的选中文字一致，否则回填位置不可信。
     if (selection.location == NSNotFound || selection.location > fullText.length ||
         selection.length > fullText.length - selection.location ||
